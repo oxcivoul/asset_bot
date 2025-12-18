@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple, Set
 
 import aiohttp
+from aiohttp import web
 import aiosqlite
 
 from aiogram import Bot, Dispatcher, Router, F
@@ -46,6 +47,26 @@ if not BOT_TOKEN:
 
 RISK_LEVELS = [5, 10, 25]
 TP_LEVELS = [5, 10, 25]
+
+async def run_health_server():
+    app = web.Application()
+
+    async def health(request):
+        return web.Response(text="ok")
+
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    # держим сервер живым
+    while True:
+        await asyncio.sleep(3600)
 
 # ---------------------------- UI helpers ----------------------------
 def main_menu_kb() -> ReplyKeyboardMarkup:
@@ -943,15 +964,17 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
+    health_task = asyncio.create_task(run_health_server())
     alert_task = asyncio.create_task(alerts_loop(bot))
     snap_task = asyncio.create_task(snapshots_loop())
 
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
-        for t in (alert_task, snap_task):
+        for t in (health_task, alert_task, snap_task):
             t.cancel()
         await cg.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
