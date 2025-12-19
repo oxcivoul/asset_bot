@@ -6,6 +6,9 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple, Set
+from html import escape
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 
 import aiohttp
 from aiohttp import web
@@ -113,6 +116,18 @@ def sign_pct(x: float) -> str:
 
 def pnl_icon(pnl_usd: float) -> str:
     return "📈" if pnl_usd >= 0 else "📉"
+
+def fmt_price(x: Optional[float]) -> str:
+    if x is None:
+        return "—"
+    ax = abs(x)
+    if ax >= 1000:
+        return f"{x:,.2f}"
+    if ax >= 1:
+        return f"{x:,.4f}".rstrip("0").rstrip(".")
+    if ax >= 0.01:
+        return f"{x:,.6f}".rstrip("0").rstrip(".")
+    return (f"{x:.10f}".rstrip("0").rstrip(".")) or "0"
 
 def safe_float(text: str) -> Optional[float]:
     t = (text or "").strip().replace(",", ".")
@@ -497,6 +512,14 @@ def fmt_levels(entry: float, pcts: List[int], kind: str) -> str:
             parts.append(f"{fmt_usd(price)} (+{p}%)")
     return ", ".join(parts)
 
+def summary_alerts_badge(risk_pcts: List[int], tp_pcts: List[int]) -> str:
+    parts = []
+    if risk_pcts:
+        parts.append("📉 " + ",".join(f"-{p}%" for p in risk_pcts))
+    if tp_pcts:
+        parts.append("📈 " + ",".join(f"+{p}%" for p in tp_pcts))
+    return f" | {' '.join(parts)}" if parts else ""
+
 def asset_card(comp: AssetComputed, risk_pcts: List[int], tp_pcts: List[int]) -> str:
     title = f"🛠 {comp.symbol}" + (f" ({comp.name})" if comp.name else "")
     breakeven = comp.entry
@@ -530,7 +553,7 @@ async def build_summary_text(user_id: int) -> str:
     assets = await list_assets(user_id)
     if not assets:
         return (
-            "📊 Сводка портфеля\n\n"
+            "📊 <b>Сводка портфеля</b>\n\n"
             "Активов пока нет.\n"
             "Нажми «➕ Добавить актив» и заведём первый."
         )
@@ -557,41 +580,55 @@ async def build_summary_text(user_id: int) -> str:
     known = sum(1 for cid in ids if cid in price_map)
     total_assets = len(ids)
 
-    if known == 0:
-        header = "\n".join([
-            "📊 Сводка портфеля",
-            f"Инвестировано: {fmt_usd(total_invested)}",
-            "Текущая стоимость: — (нет данных по ценам CoinGecko)",
-            "Общий PNL: —",
-            f"Цены: {known}/{total_assets}",
-            ""
-        ])
-    else:
-        total_pnl = total_value - total_invested
-        total_pnl_pct = (total_pnl / total_invested * 100.0) if total_invested > 0 else 0.0
-        head_icon = pnl_icon(total_pnl)
-
-        maybe_partial = " (частично)" if known < total_assets else ""
-        header = "\n".join([
-            "📊 Сводка портфеля",
-            f"Инвестировано: {fmt_usd(total_invested)}",
-            f"Текущая стоимость: {fmt_usd(total_value)}{maybe_partial}",
-            f"{head_icon} Общий PNL: {sign_money(total_pnl)}  ({sign_pct(total_pnl_pct)}){maybe_partial}",
-            f"Цены: {known}/{total_assets}",
-            ""
-        ])
-
-    # sort: best pnl first, unknown last
+    # сортировка: сначала известные с лучшим pnl, потом неизвестные
     computed.sort(key=lambda x: (x.pnl_usd is None, -(x.pnl_usd or 0.0)))
-
-    blocks = []
+    lines: List[str] = []
     for comp in computed:
         alerts = await list_alerts_for_asset(comp.asset_id)
-        risk_pcts = [int(r["pct"]) for r in alerts if r["type"] == "RISK"]
-        tp_pcts = [int(r["pct"]) for r in alerts if r["type"] == "TP"]
-        blocks.append(asset_card(comp, risk_pcts, tp_pcts))
+        risk_pcts = sorted({int(r["pct"]) for r in alerts if r["type"] == "RISK"})
+        tp_pcts = sorted({int(r["pct"]) for r in alerts if r["type"] == "TP"})
+        alerts_part = summary_alerts_badge(risk_pcts, tp_pcts)
 
-    return header + "\n\n".join(blocks)
+        sym = escape(comp.symbol)
+        nm = escape(comp.name) if comp.name else ""
+        name_part = f" <i>({nm})</i>" if nm else ""
+        qty_text = fmt_qty(comp.qty)
+
+        if comp.current is None or comp.pnl_usd is None or comp.pnl_pct is None:
+            line = (
+                f"• <b>{sym}</b>{name_part} · {qty_text} | "
+                f"{fmt_price(comp.entry)} → — | "
+                f"{fmt_usd(comp.invested)} → — | PNL —"
+                f"{alerts_part}"
+            )
+        else:
+            value = comp.qty * comp.current
+            line = (
+                f"• <b>{sym}</b>{name_part} · {qty_text} | "
+                f"{fmt_price(comp.entry)} → {fmt_price(comp.current)} | "
+                f"{fmt_usd(comp.invested)} → {fmt_usd(value)} | "
+                f"{pnl_icon(comp.pnl_usd)} {sign_money(comp.pnl_usd)} ({sign_pct(comp.pnl_pct)})"
+                f"{alerts_part}"
+            )
+
+        lines.append(line)
+
+    footer_lines = [
+        f"Цены: {known}/{total_assets}",
+        f"Инвестировано: {fmt_usd(total_invested)}",
+    ]
+    if known == 0:
+        footer_lines.append("Текущая стоимость: —")
+        footer_lines.append("<b>ИТОГО PNL: —</b>")
+    else:
+        footer_lines.append(f"Текущая стоимость: {fmt_usd(total_value)}")
+        total_pnl = total_value - total_invested
+        total_pnl_pct = (total_pnl / total_invested * 100.0) if total_invested > 0 else 0.0
+        footer_lines.append(
+            f"<b>{pnl_icon(total_pnl)} ИТОГО PNL: {sign_money(total_pnl)} ({sign_pct(total_pnl_pct)})</b>"
+        )
+
+    return "📊 <b>Сводка портфеля</b>\n\n" + "\n".join(lines) + "\n\n" + "\n".join(footer_lines)
 
 # ---------------------------- FSM ----------------------------
 class AddAssetFSM(StatesGroup):
@@ -829,14 +866,7 @@ async def on_add_alerts(cb: CallbackQuery, state: FSMContext):
 
         await state.clear()
         await cb.message.answer("Готово ✅ Актив добавлен.", reply_markup=main_menu_kb())
-
-        # show summary right away
-        text = await build_summary_text(cb.from_user.id)
-        msg = await cb.message.answer(text, reply_markup=summary_kb())
-        await set_last_summary_message(cb.from_user.id, cb.message.chat.id, msg.message_id)
-
         return await cb.answer("Сохранено")
-
     # toggle
     allowed = {f"RISK:{p}" for p in RISK_LEVELS} | {f"TP:{p}" for p in TP_LEVELS}
     if action in allowed:
@@ -1023,14 +1053,13 @@ async def alerts_loop(bot: Bot):
                         f"Текущая: {fmt_usd(float(current))}",
                         f"{icon} PNL сейчас: {sign_money(pnl_usd)}  ({sign_pct(pnl_pct)})"
                     ])
-
                     await bot.send_message(chat_id=int(r["user_id"]), text=text)
                     await mark_alert_triggered(int(r["alert_id"]))
-
         except Exception as e:
             log.exception("alerts_loop error: %r", e)
 
         await asyncio.sleep(PRICE_POLL_SECONDS)
+
 
 async def snapshots_loop():
     while True:
@@ -1057,7 +1086,6 @@ async def snapshots_loop():
                         total_value += qty * float(cp)
 
                 await insert_snapshot(uid, total_value=total_value, total_invested=total_invested)
-
         except Exception as e:
             log.exception("snapshots_loop error: %r", e)
 
@@ -1069,7 +1097,7 @@ async def main():
     log.info("CWD=%s", os.getcwd())
     log.info("DB_PATH=%s exists=%s", DB_PATH, os.path.exists(DB_PATH))
 
-    bot = Bot(token=BOT_TOKEN)
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await bot.delete_webhook(drop_pending_updates=True)
 
     dp = Dispatcher(storage=MemoryStorage())
