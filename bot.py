@@ -106,9 +106,12 @@ def fmt_qty(x: float) -> str:
         return f"{x:,.6f}".rstrip("0").rstrip(".")
     return f"{x:.10f}".rstrip("0").rstrip(".")
 
+def money_usd(x: float) -> str:
+    return f"${fmt_usd(x)}"
+
 def sign_money(x: float) -> str:
     s = "+" if x >= 0 else "-"
-    return f"{s}{fmt_usd(abs(x))}"
+    return f"{s}${fmt_usd(abs(x))}"
 
 def sign_pct(x: float) -> str:
     s = "+" if x >= 0 else "-"
@@ -116,6 +119,32 @@ def sign_pct(x: float) -> str:
 
 def pnl_icon(pnl_usd: float) -> str:
     return "📈" if pnl_usd >= 0 else "📉"
+
+def position_size_icon(invested_usd: float) -> str:
+    # Иконка "размера позиции" по сумме вложений. Пороги можешь менять.
+    x = abs(invested_usd)
+    if x < 100:
+        return "🟢"
+    if x < 1_000:
+        return "🟡"
+    if x < 10_000:
+        return "🟠"
+    return "🔴"
+
+def format_alert_line(risk_pcts: List[int], tp_pcts: List[int]) -> str:
+    r = set(int(x) for x in (risk_pcts or []))
+    t = set(int(x) for x in (tp_pcts or []))
+
+    both = sorted(r & t)
+    only_r = sorted(r - t)
+    only_t = sorted(t - r)
+
+    parts: List[str] = []
+    parts += [f"-{p}%" for p in only_r]
+    parts += [f"+-{p}%" for p in both]   # если выбраны и Risk и TP на один %
+    parts += [f"+{p}%" for p in only_t]
+
+    return "АЛЕРТ: " + (" ".join(parts) if parts else "❌")
 
 def fmt_price(x: Optional[float]) -> str:
     if x is None:
@@ -512,14 +541,6 @@ def fmt_levels(entry: float, pcts: List[int], kind: str) -> str:
             parts.append(f"{fmt_usd(price)} (+{p}%)")
     return ", ".join(parts)
 
-def summary_alerts_badge(risk_pcts: List[int], tp_pcts: List[int]) -> str:
-    parts = []
-    if risk_pcts:
-        parts.append("📉 " + ",".join(f"-{p}%" for p in risk_pcts))
-    if tp_pcts:
-        parts.append("📈 " + ",".join(f"+{p}%" for p in tp_pcts))
-    return f" | {' '.join(parts)}" if parts else ""
-
 def asset_card(comp: AssetComputed, risk_pcts: List[int], tp_pcts: List[int]) -> str:
     title = f"🛠 {comp.symbol}" + (f" ({comp.name})" if comp.name else "")
     breakeven = comp.entry
@@ -558,12 +579,17 @@ async def build_summary_text(user_id: int) -> str:
             "Нажми «➕ Добавить актив» и заведём первый."
         )
 
+    # Цены тянем по уникальным coingecko_id, и "Токены X/Y" тоже считаем по уникальным токенам
     ids = list({a["coingecko_id"] for a in assets})
+
     price_map: Dict[str, float] = {}
     try:
         price_map = await cg.simple_prices_usd(ids)
     except Exception as e:
         log.warning("Price fetch failed: %r", e)
+
+    known = sum(1 for cid in ids if cid in price_map)
+    total_assets = len(ids)
 
     computed: List[AssetComputed] = []
     total_invested = 0.0
@@ -573,63 +599,53 @@ async def build_summary_text(user_id: int) -> str:
         cp = price_map.get(a["coingecko_id"])
         comp = compute_asset(a, cp)
         computed.append(comp)
+
         total_invested += comp.invested
         if comp.current is not None:
             total_value += comp.qty * comp.current
 
-    known = sum(1 for cid in ids if cid in price_map)
-    total_assets = len(ids)
-
     # сортировка: сначала известные с лучшим pnl, потом неизвестные
     computed.sort(key=lambda x: (x.pnl_usd is None, -(x.pnl_usd or 0.0)))
-    lines: List[str] = []
+
+    blocks: List[str] = []
     for comp in computed:
         alerts = await list_alerts_for_asset(comp.asset_id)
         risk_pcts = sorted({int(r["pct"]) for r in alerts if r["type"] == "RISK"})
         tp_pcts = sorted({int(r["pct"]) for r in alerts if r["type"] == "TP"})
-        alerts_part = summary_alerts_badge(risk_pcts, tp_pcts)
 
         sym = escape(comp.symbol)
-        nm = escape(comp.name) if comp.name else ""
-        name_part = f" <i>({nm})</i>" if nm else ""
         qty_text = fmt_qty(comp.qty)
+        size_icon = position_size_icon(comp.invested)
 
         if comp.current is None or comp.pnl_usd is None or comp.pnl_pct is None:
-            line = (
-                f"• <b>{sym}</b>{name_part} · {qty_text} | "
-                f"{fmt_price(comp.entry)} → — | "
-                f"{fmt_usd(comp.invested)} → — | PNL —"
-                f"{alerts_part}"
-            )
+            line_top = f"• <b>{sym}</b> · PNL — {size_icon}"
         else:
-            value = comp.qty * comp.current
-            line = (
-                f"• <b>{sym}</b>{name_part} · {qty_text} | "
-                f"{fmt_price(comp.entry)} → {fmt_price(comp.current)} | "
-                f"{fmt_usd(comp.invested)} → {fmt_usd(value)} | "
-                f"{pnl_icon(comp.pnl_usd)} {sign_money(comp.pnl_usd)} ({sign_pct(comp.pnl_pct)})"
-                f"{alerts_part}"
-            )
+            icon = pnl_icon(comp.pnl_usd)
+            line_top = f"• <b>{sym}</b> · {icon} {sign_money(comp.pnl_usd)} ({sign_pct(comp.pnl_pct)}) {size_icon}"
 
-        lines.append(line)
+        line_qty = f"Кол-во монет: {qty_text}"
+        line_alert = format_alert_line(risk_pcts, tp_pcts)
 
-    footer_lines = [
-        f"Цены: {known}/{total_assets}",
-        f"Инвестировано: {fmt_usd(total_invested)}",
+        blocks.append("\n".join([line_top, line_qty, line_alert]))
+
+    footer_lines: List[str] = [
+        f"Токены {known}/{total_assets}",
+        f"Вложено: {money_usd(total_invested)}",
     ]
-    if known == 0:
+
+    # Если не по всем токенам есть цены — не показываем итоги, чтобы не врать
+    if known != total_assets:
         footer_lines.append("Текущая стоимость: —")
-        footer_lines.append("<b>ИТОГО PNL: —</b>")
+        footer_lines.append("<b>ОБЩИЙ PNL: —</b>")
     else:
-        footer_lines.append(f"Текущая стоимость: {fmt_usd(total_value)}")
+        footer_lines.append(f"Текущая стоимость: {money_usd(total_value)}")
         total_pnl = total_value - total_invested
         total_pnl_pct = (total_pnl / total_invested * 100.0) if total_invested > 0 else 0.0
         footer_lines.append(
-            f"<b>{pnl_icon(total_pnl)} ИТОГО PNL: {sign_money(total_pnl)} ({sign_pct(total_pnl_pct)})</b>"
+            f"<b>{pnl_icon(total_pnl)} ОБЩИЙ PNL: {sign_money(total_pnl)} ({sign_pct(total_pnl_pct)})</b>"
         )
 
-    return "📊 <b>Сводка портфеля</b>\n\n" + "\n".join(lines) + "\n\n" + "\n".join(footer_lines)
-
+    return "📊 <b>Сводка портфеля</b>\n\n" + "\n\n".join(blocks) + "\n\n" + "\n".join(footer_lines)
 # ---------------------------- FSM ----------------------------
 class AddAssetFSM(StatesGroup):
     ticker = State()
@@ -718,9 +734,6 @@ async def on_summary_refresh(cb: CallbackQuery):
     text = await build_summary_text(cb.from_user.id)
 
     # Если текст уже такой же — просто отвечаем, без edit_text
-    if (cb.message and cb.message.text == text):
-        return await cb.answer("Уже актуально")
-
     try:
         await cb.message.edit_text(text, reply_markup=summary_kb())
     except TelegramBadRequest as e:
@@ -1041,13 +1054,12 @@ async def alerts_loop(bot: Bot):
                     icon = pnl_icon(pnl_usd)
                     pct = int(r["pct"])
                     sym = r["symbol"]
-                    name = r["name"] or ""
 
                     direction = "📉 Риск" if t == "RISK" else "📈 Профит"
                     level_text = f"{'-' if t == 'RISK' else '+'}{pct}%"
 
                     text = "\n".join([
-                        f"⏰ АЛЕРТ: {sym}" + (f" ({name})" if name else ""),
+                        f"⏰ АЛЕРТ: {sym}",
                         f"{direction}: {level_text}",
                         f"Цель: {fmt_usd(target)}",
                         f"Текущая: {fmt_usd(float(current))}",
