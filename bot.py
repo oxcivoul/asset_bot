@@ -21,6 +21,7 @@ from aiogram.types import (
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramBadRequest
 
 import json
 import random
@@ -156,74 +157,69 @@ class CoinGeckoClient:
             await self._session.close()
 
     async def _get_json(self, path: str, params: Dict[str, str], *, tries: int = 5) -> dict:
-        """
-        Ретраи:
-          - 429: ждём Retry-After (если есть) + backoff
-          - 5xx: backoff
-          - network/timeouts: backoff
-        + сериализуем запросы через lock, чтобы alerts_loop/summary/snapshots не спамили одновременно.
-        """
         url = f"{self.BASE}{path}"
         backoff = 1.0
         last_exc: Optional[BaseException] = None
 
-        async with self._lock:
-            for attempt in range(1, tries + 1):
-                try:
-                    s = await self.session()
+        for attempt in range(1, tries + 1):
+            try:
+                s = await self.session()
+
+                # держим lock только на сетевой запрос, а не на backoff sleep
+                async with self._lock:
                     async with s.get(url, params=params) as r:
+                        status = r.status
                         text = await r.text()
+                        headers = dict(r.headers)
 
-                        if r.status == 200:
-                            try:
-                                return json.loads(text) if text else {}
-                            except Exception as e:
-                                raise RuntimeError(f"CoinGecko bad JSON ({path}): {text[:200]}") from e
+                if status == 200:
+                    try:
+                        return json.loads(text) if text else {}
+                    except Exception as e:
+                        raise RuntimeError(f"CoinGecko bad JSON ({path}): {text[:200]}") from e
 
-                        if r.status == 429:
-                            ra = r.headers.get("Retry-After", "")
-                            try:
-                                retry_after = float(ra)
-                            except Exception:
-                                retry_after = 0.0
+                if status == 429:
+                    ra = headers.get("Retry-After", "")
+                    try:
+                        retry_after = float(ra)
+                    except Exception:
+                        retry_after = 0.0
 
-                            sleep_s = max(retry_after, backoff) + random.random() * 0.25
-                            log.warning(
-                                "CoinGecko 429 on %s (attempt %d/%d). Sleep %.2fs. Body=%r",
-                                path, attempt, tries, sleep_s, text[:200]
-                            )
-                            await asyncio.sleep(sleep_s)
-                            backoff = min(backoff * 2.0, 30.0)
-                            continue
+                    sleep_s = max(retry_after, backoff) + random.random() * 0.25
+                    log.warning(
+                        "CoinGecko 429 on %s (attempt %d/%d). Sleep %.2fs. Body=%r",
+                        path, attempt, tries, sleep_s, text[:200]
+                    )
+                    await asyncio.sleep(sleep_s)
+                    backoff = min(backoff * 2.0, 30.0)
+                    continue
 
-                        if 500 <= r.status < 600:
-                            log.warning(
-                                "CoinGecko %d on %s (attempt %d/%d). Backoff %.2fs. Body=%r",
-                                r.status, path, attempt, tries, backoff, text[:200]
-                            )
-                            await asyncio.sleep(backoff + random.random() * 0.25)
-                            backoff = min(backoff * 2.0, 30.0)
-                            continue
-
-                        # 4xx кроме 429 обычно не лечатся ретраями
-                        raise RuntimeError(f"CoinGecko HTTP {r.status} on {path}: {text[:250]}")
-
-                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    last_exc = e
-                    log.warning("CoinGecko network error on %s (attempt %d/%d): %r",
-                                path, attempt, tries, e)
+                if 500 <= status < 600:
+                    log.warning(
+                        "CoinGecko %d on %s (attempt %d/%d). Backoff %.2fs. Body=%r",
+                        status, path, attempt, tries, backoff, text[:200]
+                    )
                     await asyncio.sleep(backoff + random.random() * 0.25)
                     backoff = min(backoff * 2.0, 30.0)
-                except Exception as e:
-                    last_exc = e
-                    log.warning("CoinGecko error on %s (attempt %d/%d): %r",
-                                path, attempt, tries, e)
-                    await asyncio.sleep(backoff + random.random() * 0.25)
-                    backoff = min(backoff * 2.0, 30.0)
+                    continue
 
-        # если совсем всё плохо
+                raise RuntimeError(f"CoinGecko HTTP {status} on {path}: {text[:250]}")
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                last_exc = e
+                log.warning("CoinGecko network error on %s (attempt %d/%d): %r",
+                            path, attempt, tries, e)
+                await asyncio.sleep(backoff + random.random() * 0.25)
+                backoff = min(backoff * 2.0, 30.0)
+
+            except Exception as e:
+                last_exc = e
+                log.warning("CoinGecko error on %s (attempt %d/%d): %r",
+                            path, attempt, tries, e)
+                await asyncio.sleep(backoff + random.random() * 0.25)
+                backoff = min(backoff * 2.0, 30.0)
+
         raise last_exc or RuntimeError("CoinGecko request failed")
-
     async def search(self, query: str) -> List[dict]:
         data = await self._get_json("/search", {"query": query})
         coins = data.get("coins", []) or []
@@ -236,7 +232,7 @@ class CoinGeckoClient:
             })
         return out
 
-    async def simple_prices_usd(self, ids: List[str], ttl_sec: int = 25) -> Dict[str, float]:
+    async def simple_prices_usd(self, ids: List[str], ttl_sec: int = 180) -> Dict[str, float]:
         ids = [i for i in ids if i]
         if not ids:
             return {}
@@ -683,7 +679,19 @@ async def on_summary(m: Message):
 async def on_summary_refresh(cb: CallbackQuery):
     await upsert_user(cb.from_user.id)
     text = await build_summary_text(cb.from_user.id)
-    await cb.message.edit_text(text, reply_markup=summary_kb())
+
+    # Если текст уже такой же — просто отвечаем, без edit_text
+    if (cb.message and cb.message.text == text):
+        return await cb.answer("Уже актуально")
+
+    try:
+        await cb.message.edit_text(text, reply_markup=summary_kb())
+    except TelegramBadRequest as e:
+        # Telegram ругается, если "ничего не поменялось"
+        if "message is not modified" in str(e):
+            return await cb.answer("Уже актуально")
+        raise
+
     await cb.answer("Обновлено")
 
 @router.callback_query(F.data == "nav:menu")
@@ -1062,6 +1070,8 @@ async def main():
     log.info("DB_PATH=%s exists=%s", DB_PATH, os.path.exists(DB_PATH))
 
     bot = Bot(token=BOT_TOKEN)
+    await bot.delete_webhook(drop_pending_updates=True)
+
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
