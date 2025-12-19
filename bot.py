@@ -120,17 +120,6 @@ def sign_pct(x: float) -> str:
 def pnl_icon(pnl_usd: float) -> str:
     return "📈" if pnl_usd >= 0 else "📉"
 
-def position_size_icon(invested_usd: float) -> str:
-    # Иконка "размера позиции" по сумме вложений. Пороги можешь менять.
-    x = abs(invested_usd)
-    if x < 100:
-        return "🟢"
-    if x < 1_000:
-        return "🟡"
-    if x < 10_000:
-        return "🟠"
-    return "🔴"
-
 def format_alert_line(risk_pcts: List[int], tp_pcts: List[int]) -> str:
     r = set(int(x) for x in (risk_pcts or []))
     t = set(int(x) for x in (tp_pcts or []))
@@ -141,10 +130,11 @@ def format_alert_line(risk_pcts: List[int], tp_pcts: List[int]) -> str:
 
     parts: List[str] = []
     parts += [f"-{p}%" for p in only_r]
-    parts += [f"+-{p}%" for p in both]   # если выбраны и Risk и TP на один %
+    parts += [f"+-{p}%" for p in both]
     parts += [f"+{p}%" for p in only_t]
 
-    return "АЛЕРТ: " + (" ".join(parts) if parts else "❌")
+    body = " ".join(parts) if parts else "❌"
+    return f"🔔 АЛЕРТ: {body}"
 
 def fmt_price(x: Optional[float]) -> str:
     if x is None:
@@ -551,11 +541,9 @@ def asset_card(comp: AssetComputed, risk_pcts: List[int], tp_pcts: List[int]) ->
     if comp.current is None or comp.pnl_usd is None or comp.pnl_pct is None:
         cur_line = "Текущая:   —"
         pnl_line = "PNL:       —"
-        icon_line = "📉/📈"
     else:
-        icon_line = pnl_icon(comp.pnl_usd)
-        cur_line = f"Текущая:   {fmt_usd(comp.current)}"
-        pnl_line = f"{icon_line} PNL:      {sign_money(comp.pnl_usd)}  ({sign_pct(comp.pnl_pct)})"
+        cur_line = f"Текущая:   {fmt_price(comp.current)}"
+        pnl_line = f"{pnl_icon(comp.pnl_usd)} PNL:      {sign_money(comp.pnl_usd)} ({sign_pct(comp.pnl_pct)})"
 
     return "\n".join([
         title,
@@ -579,7 +567,6 @@ async def build_summary_text(user_id: int) -> str:
             "Нажми «➕ Добавить актив» и заведём первый."
         )
 
-    # Цены тянем по уникальным coingecko_id, и "Токены X/Y" тоже считаем по уникальным токенам
     ids = list({a["coingecko_id"] for a in assets})
 
     price_map: Dict[str, float] = {}
@@ -604,7 +591,6 @@ async def build_summary_text(user_id: int) -> str:
         if comp.current is not None:
             total_value += comp.qty * comp.current
 
-    # сортировка: сначала известные с лучшим pnl, потом неизвестные
     computed.sort(key=lambda x: (x.pnl_usd is None, -(x.pnl_usd or 0.0)))
 
     blocks: List[str] = []
@@ -615,25 +601,26 @@ async def build_summary_text(user_id: int) -> str:
 
         sym = escape(comp.symbol)
         qty_text = fmt_qty(comp.qty)
-        size_icon = position_size_icon(comp.invested)
 
+        # ВЕРНУЛИ line_top (его у тебя сейчас нет, из-за этого всё падает)
         if comp.current is None or comp.pnl_usd is None or comp.pnl_pct is None:
-            line_top = f"• <b>{sym}</b> · PNL — {size_icon}"
+            line_top = f"• <b>{sym}</b> · PNL —"
         else:
             icon = pnl_icon(comp.pnl_usd)
-            line_top = f"• <b>{sym}</b> · {icon} {sign_money(comp.pnl_usd)} ({sign_pct(comp.pnl_pct)}) {size_icon}"
+            line_top = f"• <b>{sym}</b> · {icon} {sign_money(comp.pnl_usd)} ({sign_pct(comp.pnl_pct)})"
 
-        line_qty = f"Кол-во монет: {qty_text}"
-        line_alert = format_alert_line(risk_pcts, tp_pcts)
+        IND = "\u00A0\u00A0"  # 2 неразрывных пробела для красивого отступа
+
+        line_qty = f"{IND}Кол-во монет: {qty_text}"
+        line_alert = f"{IND}<b>{format_alert_line(risk_pcts, tp_pcts)}</b>"
 
         blocks.append("\n".join([line_top, line_qty, line_alert]))
 
     footer_lines: List[str] = [
-        f"Токены {known}/{total_assets}",
+        f"Токены: {known}/{total_assets}",
         f"Вложено: {money_usd(total_invested)}",
     ]
 
-    # Если не по всем токенам есть цены — не показываем итоги, чтобы не врать
     if known != total_assets:
         footer_lines.append("Текущая стоимость: —")
         footer_lines.append("<b>ОБЩИЙ PNL: —</b>")
@@ -783,7 +770,10 @@ async def on_add_ticker(m: Message, state: FSMContext):
     coins_sorted = sorted(coins, key=lambda c: (c.get("symbol") != q_up, c.get("name") or ""))
     await state.update_data(coins=coins_sorted[:10])
     await state.set_state(AddAssetFSM.choose_coin)
-    await m.answer("Выбери монету (у тикеров бывают совпадения):", reply_markup=coin_choice_kb(coins_sorted))
+    await m.answer(
+    "Выбери монету (у тикеров бывают совпадения):",
+    reply_markup=coin_choice_kb(coins_sorted)
+)
 
 @router.callback_query(AddAssetFSM.choose_coin, F.data.startswith("add:coin:"))
 async def on_add_choose_coin(cb: CallbackQuery, state: FSMContext):
@@ -1051,27 +1041,25 @@ async def alerts_loop(bot: Bot):
                     pnl_usd = qty * float(current) - invested
                     pnl_pct = (pnl_usd / invested * 100.0) if invested > 0 else 0.0
 
-                    icon = pnl_icon(pnl_usd)
                     pct = int(r["pct"])
-                    sym = r["symbol"]
+                    sym = str(r["symbol"] or "")
 
-                    direction = "📉 Риск" if t == "RISK" else "📈 Профит"
-                    level_text = f"{'-' if t == 'RISK' else '+'}{pct}%"
+                    move_icon = "🔴" if t == "RISK" else "🟢"
+                    move_text = f"Цена снизилась на {pct}%" if t == "RISK" else f"Цена увеличилась на {pct}%"
 
                     text = "\n".join([
-                        f"⏰ АЛЕРТ: {sym}",
-                        f"{direction}: {level_text}",
-                        f"Цель: {fmt_usd(target)}",
-                        f"Текущая: {fmt_usd(float(current))}",
-                        f"{icon} PNL сейчас: {sign_money(pnl_usd)}  ({sign_pct(pnl_pct)})"
+                        f"🔔 АЛЕРТ: <b>{escape(sym)}</b>",
+                        f"{move_icon} {move_text}",
+                        f"Текущая цена: {fmt_price(float(current))}",
+                        f"{pnl_icon(pnl_usd)} PNL сейчас: {sign_money(pnl_usd)} ({sign_pct(pnl_pct)})",
                     ])
+
                     await bot.send_message(chat_id=int(r["user_id"]), text=text)
                     await mark_alert_triggered(int(r["alert_id"]))
         except Exception as e:
             log.exception("alerts_loop error: %r", e)
 
         await asyncio.sleep(PRICE_POLL_SECONDS)
-
 
 async def snapshots_loop():
     while True:
