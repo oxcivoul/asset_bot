@@ -22,6 +22,10 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
+import json
+import random
+import socket
+
 # Load .env if present
 try:
     from dotenv import load_dotenv  # type: ignore
@@ -120,31 +124,108 @@ def safe_float(text: str) -> Optional[float]:
     except Exception:
         return None
 
-# ---------------------------- CoinGecko client ----------------------------
 class CoinGeckoClient:
-    BASE = "https://api.coingecko.com/api/v3"
+    BASE = os.getenv("COINGECKO_BASE", "https://api.coingecko.com/api/v3").strip()
 
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
-        # cache for batch price calls: key(sorted ids) -> (ts, map)
         self._price_cache: Dict[str, Tuple[float, Dict[str, float]]] = {}
+        self._lock = asyncio.Lock()
+
+        self._api_key = os.getenv("COINGECKO_API_KEY", "").strip()
+        self._headers = {
+            "User-Agent": "asset-accountant-bot/1.0 (+https://github.com/your/repo)",
+            "Accept": "application/json",
+        }
+        # Если у тебя появится ключ CoinGecko (demo/pro), он просто начнёт использоваться.
+        # Лишние заголовки CoinGecko обычно игнорит, зато не ломают запросы.
+        if self._api_key:
+            self._headers["x-cg-demo-api-key"] = self._api_key
+            self._headers["x-cg-pro-api-key"] = self._api_key
 
     async def session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=15)
-            self._session = aiohttp.ClientSession(timeout=timeout)
+            timeout = aiohttp.ClientTimeout(total=20, connect=10, sock_read=15)
+            force_ipv4 = os.getenv("FORCE_IPV4", "0").strip() == "1"
+            connector = aiohttp.TCPConnector(family=socket.AF_INET) if force_ipv4 else aiohttp.TCPConnector()
+            self._session = aiohttp.ClientSession(timeout=timeout, connector=connector, headers=self._headers)
         return self._session
 
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
 
+    async def _get_json(self, path: str, params: Dict[str, str], *, tries: int = 5) -> dict:
+        """
+        Ретраи:
+          - 429: ждём Retry-After (если есть) + backoff
+          - 5xx: backoff
+          - network/timeouts: backoff
+        + сериализуем запросы через lock, чтобы alerts_loop/summary/snapshots не спамили одновременно.
+        """
+        url = f"{self.BASE}{path}"
+        backoff = 1.0
+        last_exc: Optional[BaseException] = None
+
+        async with self._lock:
+            for attempt in range(1, tries + 1):
+                try:
+                    s = await self.session()
+                    async with s.get(url, params=params) as r:
+                        text = await r.text()
+
+                        if r.status == 200:
+                            try:
+                                return json.loads(text) if text else {}
+                            except Exception as e:
+                                raise RuntimeError(f"CoinGecko bad JSON ({path}): {text[:200]}") from e
+
+                        if r.status == 429:
+                            ra = r.headers.get("Retry-After", "")
+                            try:
+                                retry_after = float(ra)
+                            except Exception:
+                                retry_after = 0.0
+
+                            sleep_s = max(retry_after, backoff) + random.random() * 0.25
+                            log.warning(
+                                "CoinGecko 429 on %s (attempt %d/%d). Sleep %.2fs. Body=%r",
+                                path, attempt, tries, sleep_s, text[:200]
+                            )
+                            await asyncio.sleep(sleep_s)
+                            backoff = min(backoff * 2.0, 30.0)
+                            continue
+
+                        if 500 <= r.status < 600:
+                            log.warning(
+                                "CoinGecko %d on %s (attempt %d/%d). Backoff %.2fs. Body=%r",
+                                r.status, path, attempt, tries, backoff, text[:200]
+                            )
+                            await asyncio.sleep(backoff + random.random() * 0.25)
+                            backoff = min(backoff * 2.0, 30.0)
+                            continue
+
+                        # 4xx кроме 429 обычно не лечатся ретраями
+                        raise RuntimeError(f"CoinGecko HTTP {r.status} on {path}: {text[:250]}")
+
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    last_exc = e
+                    log.warning("CoinGecko network error on %s (attempt %d/%d): %r",
+                                path, attempt, tries, e)
+                    await asyncio.sleep(backoff + random.random() * 0.25)
+                    backoff = min(backoff * 2.0, 30.0)
+                except Exception as e:
+                    last_exc = e
+                    log.warning("CoinGecko error on %s (attempt %d/%d): %r",
+                                path, attempt, tries, e)
+                    await asyncio.sleep(backoff + random.random() * 0.25)
+                    backoff = min(backoff * 2.0, 30.0)
+
+        # если совсем всё плохо
+        raise last_exc or RuntimeError("CoinGecko request failed")
+
     async def search(self, query: str) -> List[dict]:
-        s = await self.session()
-        url = f"{self.BASE}/search"
-        async with s.get(url, params={"query": query}) as r:
-            r.raise_for_status()
-            data = await r.json()
+        data = await self._get_json("/search", {"query": query})
         coins = data.get("coins", []) or []
         out = []
         for c in coins:
@@ -159,6 +240,8 @@ class CoinGeckoClient:
         ids = [i for i in ids if i]
         if not ids:
             return {}
+
+        # cache key
         key = ",".join(sorted(set(ids)))
         now = time.time()
         if key in self._price_cache:
@@ -166,18 +249,19 @@ class CoinGeckoClient:
             if now - ts <= ttl_sec:
                 return cached
 
-        s = await self.session()
-        url = f"{self.BASE}/simple/price"
-        async with s.get(url, params={"ids": key, "vs_currencies": "usd"}) as r:
-            r.raise_for_status()
-            data = await r.json()
-
+        # CoinGecko любит ограничивать размер ids; чанкнем на всякий случай
+        uniq = sorted(set(ids))
         out: Dict[str, float] = {}
-        for cid, row in (data or {}).items():
-            try:
-                out[cid] = float(row["usd"])
-            except Exception:
-                continue
+
+        CHUNK = 100
+        for i in range(0, len(uniq), CHUNK):
+            chunk = uniq[i:i + CHUNK]
+            data = await self._get_json("/simple/price", {"ids": ",".join(chunk), "vs_currencies": "usd"})
+            for cid, row in (data or {}).items():
+                try:
+                    out[cid] = float(row["usd"])
+                except Exception:
+                    continue
 
         self._price_cache[key] = (now, out)
         return out
@@ -474,17 +558,32 @@ async def build_summary_text(user_id: int) -> str:
         if comp.current is not None:
             total_value += comp.qty * comp.current
 
-    total_pnl = total_value - total_invested
-    total_pnl_pct = (total_pnl / total_invested * 100.0) if total_invested > 0 else 0.0
-    head_icon = pnl_icon(total_pnl)
+    known = sum(1 for cid in ids if cid in price_map)
+    total_assets = len(ids)
 
-    header = "\n".join([
-        "📊 Сводка портфеля",
-        f"Инвестировано: {fmt_usd(total_invested)}",
-        f"Текущая стоимость: {fmt_usd(total_value)}",
-        f"{head_icon} Общий PNL: {sign_money(total_pnl)}  ({sign_pct(total_pnl_pct)})",
-        ""
-    ])
+    if known == 0:
+        header = "\n".join([
+            "📊 Сводка портфеля",
+            f"Инвестировано: {fmt_usd(total_invested)}",
+            "Текущая стоимость: — (нет данных по ценам CoinGecko)",
+            "Общий PNL: —",
+            f"Цены: {known}/{total_assets}",
+            ""
+        ])
+    else:
+        total_pnl = total_value - total_invested
+        total_pnl_pct = (total_pnl / total_invested * 100.0) if total_invested > 0 else 0.0
+        head_icon = pnl_icon(total_pnl)
+
+        maybe_partial = " (частично)" if known < total_assets else ""
+        header = "\n".join([
+            "📊 Сводка портфеля",
+            f"Инвестировано: {fmt_usd(total_invested)}",
+            f"Текущая стоимость: {fmt_usd(total_value)}{maybe_partial}",
+            f"{head_icon} Общий PNL: {sign_money(total_pnl)}  ({sign_pct(total_pnl_pct)}){maybe_partial}",
+            f"Цены: {known}/{total_assets}",
+            ""
+        ])
 
     # sort: best pnl first, unknown last
     computed.sort(key=lambda x: (x.pnl_usd is None, -(x.pnl_usd or 0.0)))
@@ -959,6 +1058,8 @@ async def snapshots_loop():
 # ---------------------------- main ----------------------------
 async def main():
     await init_db()
+    log.info("CWD=%s", os.getcwd())
+    log.info("DB_PATH=%s exists=%s", DB_PATH, os.path.exists(DB_PATH))
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
