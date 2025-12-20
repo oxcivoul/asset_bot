@@ -52,8 +52,8 @@ DB_BACKEND = os.getenv("DB_BACKEND", "postgres").strip().lower()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 PG_POOL_SIZE = int(os.getenv("PG_POOL_SIZE", "5"))
 
-PRICE_POLL_SECONDS = int(os.getenv("PRICE_POLL_SECONDS", "90"))
-SNAPSHOT_EVERY_SECONDS = int(os.getenv("SNAPSHOT_EVERY_SECONDS", "3600"))
+PRICE_POLL_SECONDS = int(os.getenv("PRICE_POLL_SECONDS", "180"))
+SNAPSHOT_EVERY_SECONDS = int(os.getenv("SNAPSHOT_EVERY_SECONDS", "14400"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN. Put it into your .env (BOT_TOKEN=...)")
@@ -182,7 +182,7 @@ class CoinGeckoClient:
         # NEW: limiter (simple spacing between requests)
         self._rl_lock = asyncio.Lock()
         self._last_request_ts = 0.0
-        self._min_interval_sec = float(os.getenv("COINGECKO_MIN_INTERVAL_SEC", "0.35"))
+        self._min_interval_sec = float(os.getenv("COINGECKO_MIN_INTERVAL_SEC", "1.2"))
         # 0.35s ~= до ~170 req/min в "идеале"; для free-tier можно и 0.6-1.0
 
         # NEW: adaptive backoff (when CoinGecko returns 429)
@@ -191,8 +191,8 @@ class CoinGeckoClient:
         self._penalty_min_interval_sec = self._min_interval_sec
         self._penalty_ttl_sec = 0  # extra TTL during penalty window
 
-        # network lock not needed: rate-limit + retries already protect us
-        self._net_lock = None
+        # NEW: serialize actual HTTP calls too (prevents parallel in-flight requests)
+        self._net_lock = asyncio.Lock()
 
         self._api_key = os.getenv("COINGECKO_API_KEY", "").strip()
         self._headers = {
@@ -255,72 +255,77 @@ class CoinGeckoClient:
                 self._penalty_ttl_sec = int(self._penalty_ttl_sec * 0.9)
 
     async def _get_json(self, path: str, params: Dict[str, str], *, tries: int = 5) -> dict:
-        url = f"{self.BASE}{path}"
-        backoff = 1.0
-        last_exc: Optional[BaseException] = None
+        async with self._net_lock:
+            url = f"{self.BASE}{path}"
+            backoff = 1.0
+            last_exc: Optional[BaseException] = None
 
-        for attempt in range(1, tries + 1):
-            try:
-                s = await self.session()
+            for attempt in range(1, tries + 1):
+                try:
+                    s = await self.session()
 
-                await self._rate_limit_wait()
+                    await self._rate_limit_wait()
 
-                # network request (rate-limit already applied)
-                async with s.get(url, params=params) as r:
-                    status = r.status
-                    text = await r.text()
-                    headers = dict(r.headers)
+                    # network request (rate-limit already applied)
+                    async with s.get(url, params=params) as r:
+                        status = r.status
+                        text = await r.text()
+                        headers = dict(r.headers)
 
-                if status == 200:
-                    try:
-                        return json.loads(text) if text else {}
-                    except Exception as e:
-                        raise RuntimeError(f"CoinGecko bad JSON ({path}): {text[:200]}") from e
+                    if status == 200:
+                        try:
+                            return json.loads(text) if text else {}
+                        except Exception as e:
+                            raise RuntimeError(f"CoinGecko bad JSON ({path}): {text[:200]}") from e
 
-                if status == 429:
-                    ra = headers.get("Retry-After", "")
-                    try:
-                        retry_after = float(ra)
-                    except Exception:
-                        retry_after = 0.0
+                    if status == 429:
+                        ra = headers.get("Retry-After", "")
+                        try:
+                            retry_after = float(ra)
+                        except Exception:
+                            retry_after = 0.0
 
-                    self._enable_penalty(retry_after=retry_after)
+                        self._enable_penalty(retry_after=retry_after)
 
-                    sleep_s = max(retry_after, backoff) + random.random() * 0.25
+                        sleep_s = max(retry_after, backoff) + random.random() * 0.25
+                        log.warning(
+                            "CoinGecko 429 on %s (attempt %d/%d). Sleep %.2fs. Body=%r",
+                            path, attempt, tries, sleep_s, text[:200]
+                        )
+                        await asyncio.sleep(sleep_s)
+                        backoff = min(backoff * 2.0, 30.0)
+                        continue
+
+                    if 500 <= status < 600:
+                        log.warning(
+                            "CoinGecko %d on %s (attempt %d/%d). Backoff %.2fs. Body=%r",
+                            status, path, attempt, tries, backoff, text[:200]
+                        )
+                        await asyncio.sleep(backoff + random.random() * 0.25)
+                        backoff = min(backoff * 2.0, 30.0)
+                        continue
+
+                    raise RuntimeError(f"CoinGecko HTTP {status} on {path}: {text[:250]}")
+
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    last_exc = e
                     log.warning(
-                        "CoinGecko 429 on %s (attempt %d/%d). Sleep %.2fs. Body=%r",
-                        path, attempt, tries, sleep_s, text[:200]
-                    )
-                    await asyncio.sleep(sleep_s)
-                    backoff = min(backoff * 2.0, 30.0)
-                    continue
-
-                if 500 <= status < 600:
-                    log.warning(
-                        "CoinGecko %d on %s (attempt %d/%d). Backoff %.2fs. Body=%r",
-                        status, path, attempt, tries, backoff, text[:200]
+                        "CoinGecko network error on %s (attempt %d/%d): %r",
+                        path, attempt, tries, e
                     )
                     await asyncio.sleep(backoff + random.random() * 0.25)
                     backoff = min(backoff * 2.0, 30.0)
-                    continue
 
-                raise RuntimeError(f"CoinGecko HTTP {status} on {path}: {text[:250]}")
+                except Exception as e:
+                    last_exc = e
+                    log.warning(
+                        "CoinGecko error on %s (attempt %d/%d): %r",
+                        path, attempt, tries, e
+                    )
+                    await asyncio.sleep(backoff + random.random() * 0.25)
+                    backoff = min(backoff * 2.0, 30.0)
 
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                last_exc = e
-                log.warning("CoinGecko network error on %s (attempt %d/%d): %r",
-                            path, attempt, tries, e)
-                await asyncio.sleep(backoff + random.random() * 0.25)
-                backoff = min(backoff * 2.0, 30.0)
-
-            except Exception as e:
-                last_exc = e
-                log.warning("CoinGecko error on %s (attempt %d/%d): %r",
-                            path, attempt, tries, e)
-                await asyncio.sleep(backoff + random.random() * 0.25)
-                backoff = min(backoff * 2.0, 30.0)
-
-        raise last_exc or RuntimeError("CoinGecko request failed")
+            raise last_exc or RuntimeError("CoinGecko request failed")
 
     async def search(self, query: str, ttl_sec: int = 600) -> List[dict]:
         q = (query or "").strip().lower()
