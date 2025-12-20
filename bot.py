@@ -388,6 +388,8 @@ cg = CoinGeckoClient()
 
 # ---------------------------- DB (Postgres / Neon) ----------------------------
 pg_pool: Optional[asyncpg.Pool] = None
+INSTANCE_LOCK_KEY = int(os.getenv("INSTANCE_LOCK_KEY", "912345678901234567"))
+instance_lock_conn: Optional[asyncpg.Connection] = None
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -458,6 +460,54 @@ async def init_db():
         except Exception:
             log.exception("Migration failed: ALTER TABLE assets ADD COLUMN qty_override")
             raise
+
+async def acquire_instance_lock() -> bool:
+    """
+    Берём pg_try_advisory_lock на выделенном соединении.
+    Если lock не взят — это значит, что другой инстанс уже работает.
+    """
+    global instance_lock_conn
+    assert pg_pool is not None
+
+    # если вдруг уже брали — считаем ок
+    if instance_lock_conn is not None:
+        return True
+
+    conn = await pg_pool.acquire()
+    try:
+        row = await conn.fetchrow("SELECT pg_try_advisory_lock($1) AS ok", INSTANCE_LOCK_KEY)
+        ok = bool(row["ok"])
+        if ok:
+            # ВАЖНО: не release() — держим соединение живым, иначе lock пропадёт
+            instance_lock_conn = conn
+            log.info("Instance lock acquired (key=%s)", INSTANCE_LOCK_KEY)
+            return True
+    finally:
+        # lock не взяли — возвращаем соединение в пул
+        if instance_lock_conn is None:
+            await pg_pool.release(conn)
+
+    log.warning("Instance lock NOT acquired (key=%s). Another instance is running.", INSTANCE_LOCK_KEY)
+    return False
+
+
+async def release_instance_lock():
+    global instance_lock_conn
+    if instance_lock_conn is None or pg_pool is None:
+        return
+
+    try:
+        await instance_lock_conn.execute("SELECT pg_advisory_unlock($1)", INSTANCE_LOCK_KEY)
+    except Exception:
+        # даже если unlock упал, при закрытии соединения lock всё равно уйдёт
+        pass
+
+    try:
+        await pg_pool.release(instance_lock_conn)
+    except Exception:
+        pass
+
+    instance_lock_conn = None
 
 async def db_exec(sql: str, params: tuple = ()):
     assert pg_pool is not None
@@ -1351,22 +1401,52 @@ async def main():
     log.info("CWD=%s", os.getcwd())
     log.info("DB_BACKEND=%s", DB_BACKEND)
 
+    health_task = asyncio.create_task(run_health_server())
+
+    got_lock = await acquire_instance_lock()
+    if not got_lock:
+        log.error("Another instance is running. Not starting polling/loops.")
+
+        # Мы тут не будем работать как бот — значит можно закрыть лишние ресурсы
+        try:
+            await cg.close()
+        finally:
+            if pg_pool is not None:
+                await pg_pool.close()
+
+        # держим только health, чтобы Render не считал сервис мёртвым
+        await health_task
+        return
+
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await bot.delete_webhook(drop_pending_updates=True)
 
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    health_task = asyncio.create_task(run_health_server())
     alert_task = asyncio.create_task(alerts_loop(bot))
     snap_task = asyncio.create_task(snapshots_loop())
+
+    tasks = (health_task, alert_task, snap_task)
 
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
-        for t in (health_task, alert_task, snap_task):
+        for t in tasks:
             t.cancel()
+
+        # "чисто" дождаться отмены тасков, без спама предупреждениями
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+        await release_instance_lock()
         await cg.close()
+
+        # (опционально, но полезно) закрыть HTTP-сессию бота
+        try:
+            await bot.session.close()
+        except Exception:
+            pass
+
         if pg_pool is not None:
             await pg_pool.close()
 
