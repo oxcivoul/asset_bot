@@ -12,7 +12,7 @@ from aiogram.enums import ParseMode
 
 import aiohttp
 from aiohttp import web
-import aiosqlite
+import asyncpg
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import CommandStart
@@ -46,12 +46,20 @@ log = logging.getLogger("asset-accountant-bot")
 
 # ---------------------------- config ----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
+
+# DB (Postgres / Neon)
+DB_BACKEND = os.getenv("DB_BACKEND", "postgres").strip().lower()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+PG_POOL_SIZE = int(os.getenv("PG_POOL_SIZE", "5"))
+
 PRICE_POLL_SECONDS = int(os.getenv("PRICE_POLL_SECONDS", "90"))
 SNAPSHOT_EVERY_SECONDS = int(os.getenv("SNAPSHOT_EVERY_SECONDS", "3600"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN. Put it into your .env (BOT_TOKEN=...)")
+
+if DB_BACKEND == "postgres" and not DATABASE_URL:
+    raise RuntimeError("Missing DATABASE_URL (Neon). Set it in Render env.")
 
 RISK_LEVELS = [5, 10, 25]
 TP_LEVELS = [5, 10, 25]
@@ -164,16 +172,33 @@ class CoinGeckoClient:
 
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
-        self._price_cache: Dict[str, Tuple[float, Dict[str, float]]] = {}
-        self._lock = asyncio.Lock()
+
+        # NEW: cache per-id (price)
+        self._price_cache_id: Dict[str, Tuple[float, float]] = {}
+
+        # NEW: cache for search(query)
+        self._search_cache: Dict[str, Tuple[float, List[dict]]] = {}
+
+        # NEW: limiter (simple spacing between requests)
+        self._rl_lock = asyncio.Lock()
+        self._last_request_ts = 0.0
+        self._min_interval_sec = float(os.getenv("COINGECKO_MIN_INTERVAL_SEC", "0.35"))
+        # 0.35s ~= до ~170 req/min в "идеале"; для free-tier можно и 0.6-1.0
+
+        # NEW: adaptive backoff (when CoinGecko returns 429)
+        self._base_min_interval_sec = self._min_interval_sec
+        self._penalty_until_ts = 0.0
+        self._penalty_min_interval_sec = self._min_interval_sec
+        self._penalty_ttl_sec = 0  # extra TTL during penalty window
+
+        # network lock not needed: rate-limit + retries already protect us
+        self._net_lock = None
 
         self._api_key = os.getenv("COINGECKO_API_KEY", "").strip()
         self._headers = {
             "User-Agent": "asset-accountant-bot/1.0 (+https://github.com/your/repo)",
             "Accept": "application/json",
         }
-        # Если у тебя появится ключ CoinGecko (demo/pro), он просто начнёт использоваться.
-        # Лишние заголовки CoinGecko обычно игнорит, зато не ломают запросы.
         if self._api_key:
             self._headers["x-cg-demo-api-key"] = self._api_key
             self._headers["x-cg-pro-api-key"] = self._api_key
@@ -190,6 +215,45 @@ class CoinGeckoClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
+    def _enable_penalty(self, *, retry_after: float):
+        # Increase throttling for a while to reduce 429s.
+        now = time.time()
+        # window: at least 120s, plus server hint
+        window = max(120.0, retry_after, 0.0)
+        self._penalty_until_ts = max(self._penalty_until_ts, now + window)
+
+        # min interval: grow up to 2.5s
+        self._penalty_min_interval_sec = min(
+            max(self._penalty_min_interval_sec * 1.5, self._min_interval_sec),
+            2.5
+        )
+
+        # cache TTL penalty: grow up to +900s
+        self._penalty_ttl_sec = min(
+            max(int(self._penalty_ttl_sec * 1.5), 120),
+            900
+        )
+
+    async def _rate_limit_wait(self):
+        # simple global pacing between requests (+ adaptive penalty on 429)
+        async with self._rl_lock:
+            now = time.time()
+            in_penalty = now < self._penalty_until_ts
+            interval = self._penalty_min_interval_sec if in_penalty else self._min_interval_sec
+
+            wait = (self._last_request_ts + interval) - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_request_ts = time.time()
+
+            # decay penalty when window ends
+            if not in_penalty:
+                self._penalty_min_interval_sec = max(
+                    self._base_min_interval_sec,
+                    self._penalty_min_interval_sec * 0.9
+                )
+                self._penalty_ttl_sec = int(self._penalty_ttl_sec * 0.9)
+
     async def _get_json(self, path: str, params: Dict[str, str], *, tries: int = 5) -> dict:
         url = f"{self.BASE}{path}"
         backoff = 1.0
@@ -199,12 +263,13 @@ class CoinGeckoClient:
             try:
                 s = await self.session()
 
-                # держим lock только на сетевой запрос, а не на backoff sleep
-                async with self._lock:
-                    async with s.get(url, params=params) as r:
-                        status = r.status
-                        text = await r.text()
-                        headers = dict(r.headers)
+                await self._rate_limit_wait()
+
+                # network request (rate-limit already applied)
+                async with s.get(url, params=params) as r:
+                    status = r.status
+                    text = await r.text()
+                    headers = dict(r.headers)
 
                 if status == 200:
                     try:
@@ -218,6 +283,8 @@ class CoinGeckoClient:
                         retry_after = float(ra)
                     except Exception:
                         retry_after = 0.0
+
+                    self._enable_penalty(retry_after=retry_after)
 
                     sleep_s = max(retry_after, backoff) + random.random() * 0.25
                     log.warning(
@@ -254,7 +321,17 @@ class CoinGeckoClient:
                 backoff = min(backoff * 2.0, 30.0)
 
         raise last_exc or RuntimeError("CoinGecko request failed")
-    async def search(self, query: str) -> List[dict]:
+
+    async def search(self, query: str, ttl_sec: int = 600) -> List[dict]:
+        q = (query or "").strip().lower()
+        if not q:
+            return []
+
+        now = time.time()
+        rec = self._search_cache.get(q)
+        if rec and now - rec[0] <= ttl_sec:
+            return rec[1]
+
         data = await self._get_json("/search", {"query": query})
         coins = data.get("coins", []) or []
         out = []
@@ -264,6 +341,8 @@ class CoinGeckoClient:
                 "name": c.get("name"),
                 "symbol": (c.get("symbol") or "").upper(),
             })
+
+        self._search_cache[q] = (now, out)
         return out
 
     async def simple_prices_usd(self, ids: List[str], ttl_sec: int = 180) -> Dict[str, float]:
@@ -271,168 +350,193 @@ class CoinGeckoClient:
         if not ids:
             return {}
 
-        # cache key
-        key = ",".join(sorted(set(ids)))
         now = time.time()
-        if key in self._price_cache:
-            ts, cached = self._price_cache[key]
-            if now - ts <= ttl_sec:
-                return cached
+        in_penalty = now < self._penalty_until_ts
+        effective_ttl = ttl_sec + (self._penalty_ttl_sec if in_penalty else 0)
 
-        # CoinGecko любит ограничивать размер ids; чанкнем на всякий случай
         uniq = sorted(set(ids))
-        out: Dict[str, float] = {}
+
+        # take fresh from per-id cache
+        fresh: Dict[str, float] = {}
+        stale: List[str] = []
+        for cid in uniq:
+            rec = self._price_cache_id.get(cid)
+            if rec and now - rec[0] <= effective_ttl:
+                fresh[cid] = rec[1]
+            else:
+                stale.append(cid)
+
+        out: Dict[str, float] = dict(fresh)
+        if not stale:
+            return out
 
         CHUNK = 100
-        for i in range(0, len(uniq), CHUNK):
-            chunk = uniq[i:i + CHUNK]
+        for i in range(0, len(stale), CHUNK):
+            chunk = stale[i:i + CHUNK]
             data = await self._get_json("/simple/price", {"ids": ",".join(chunk), "vs_currencies": "usd"})
             for cid, row in (data or {}).items():
                 try:
-                    out[cid] = float(row["usd"])
+                    price = float(row["usd"])
                 except Exception:
                     continue
+                out[cid] = price
+                self._price_cache_id[cid] = (now, price)
 
-        self._price_cache[key] = (now, out)
         return out
 
 cg = CoinGeckoClient()
 
-# ---------------------------- DB ----------------------------
-SCHEMA_SQL = """
-PRAGMA journal_mode=WAL;
+# ---------------------------- DB (Postgres / Neon) ----------------------------
+pg_pool: Optional[asyncpg.Pool] = None
 
+SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS users (
-  user_id INTEGER PRIMARY KEY,
+  user_id BIGINT PRIMARY KEY,
   currency TEXT NOT NULL DEFAULT 'USD',
-  last_summary_chat_id INTEGER,
-  last_summary_message_id INTEGER
+  last_summary_chat_id BIGINT,
+  last_summary_message_id BIGINT
 );
 
 CREATE TABLE IF NOT EXISTS assets (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL,
+  id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
   symbol TEXT NOT NULL,
   coingecko_id TEXT NOT NULL,
   name TEXT,
-  invested_usd REAL NOT NULL,
-  entry_price REAL NOT NULL,
-  created_at INTEGER NOT NULL,
-  FOREIGN KEY(user_id) REFERENCES users(user_id)
+  invested_usd DOUBLE PRECISION NOT NULL,
+  entry_price DOUBLE PRECISION NOT NULL,
+  created_at BIGINT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_assets_user ON assets(user_id);
 CREATE INDEX IF NOT EXISTS idx_assets_cgid ON assets(coingecko_id);
 
 CREATE TABLE IF NOT EXISTS alerts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  asset_id INTEGER NOT NULL,
+  id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  asset_id BIGINT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
   type TEXT NOT NULL,               -- 'RISK' or 'TP'
   pct INTEGER NOT NULL,             -- 5/10/25
-  target_price REAL NOT NULL,
+  target_price DOUBLE PRECISION NOT NULL,
   triggered INTEGER NOT NULL DEFAULT 0,
-  triggered_at INTEGER,
-  FOREIGN KEY(asset_id) REFERENCES assets(id)
+  triggered_at BIGINT
 );
 
 CREATE INDEX IF NOT EXISTS idx_alerts_asset ON alerts(asset_id);
 CREATE INDEX IF NOT EXISTS idx_alerts_triggered ON alerts(triggered);
 
 CREATE TABLE IF NOT EXISTS pnl_snapshots (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL,
-  ts INTEGER NOT NULL,
-  total_value_usd REAL NOT NULL,
-  total_invested_usd REAL NOT NULL,
-  total_pnl_usd REAL NOT NULL,
-  FOREIGN KEY(user_id) REFERENCES users(user_id)
+  id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+  user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+  ts BIGINT NOT NULL,
+  total_value_usd DOUBLE PRECISION NOT NULL,
+  total_invested_usd DOUBLE PRECISION NOT NULL,
+  total_pnl_usd DOUBLE PRECISION NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_snap_user_ts ON pnl_snapshots(user_id, ts);
 """
 
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.executescript(SCHEMA_SQL)
-        await db.commit()
+    global pg_pool
+    if DB_BACKEND != "postgres":
+        raise RuntimeError(f"Unsupported DB_BACKEND={DB_BACKEND}. Use postgres.")
+
+    pg_pool = await asyncpg.create_pool(
+        dsn=DATABASE_URL,
+        min_size=1,
+        max_size=PG_POOL_SIZE,
+        command_timeout=30,
+    )
+    async with pg_pool.acquire() as conn:
+        await conn.execute(SCHEMA_SQL)
 
 async def db_exec(sql: str, params: tuple = ()):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(sql, params)
-        await db.commit()
+    assert pg_pool is not None
+    async with pg_pool.acquire() as conn:
+        await conn.execute(sql, *params)
 
 async def db_fetchone(sql: str, params: tuple = ()):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(sql, params) as cur:
-            return await cur.fetchone()
+    assert pg_pool is not None
+    async with pg_pool.acquire() as conn:
+        row = await conn.fetchrow(sql, *params)
+        return dict(row) if row else None
 
 async def db_fetchall(sql: str, params: tuple = ()):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(sql, params) as cur:
-            return await cur.fetchall()
+    assert pg_pool is not None
+    async with pg_pool.acquire() as conn:
+        rows = await conn.fetch(sql, *params)
+        return [dict(r) for r in rows]
 
 async def upsert_user(user_id: int):
     await db_exec(
-        "INSERT INTO users(user_id) VALUES (?) ON CONFLICT(user_id) DO NOTHING",
+        "INSERT INTO users(user_id) VALUES ($1) ON CONFLICT(user_id) DO NOTHING",
         (user_id,)
     )
 
 async def set_last_summary_message(user_id: int, chat_id: int, message_id: int):
     await db_exec(
-        "UPDATE users SET last_summary_chat_id=?, last_summary_message_id=? WHERE user_id=?",
+        "UPDATE users SET last_summary_chat_id=$1, last_summary_message_id=$2 WHERE user_id=$3",
         (chat_id, message_id, user_id)
     )
 
 async def list_assets(user_id: int):
     return await db_fetchall(
-        "SELECT * FROM assets WHERE user_id=? ORDER BY id DESC",
+        "SELECT * FROM assets WHERE user_id=$1 ORDER BY id DESC",
         (user_id,)
     )
 
 async def get_asset(user_id: int, asset_id: int):
     return await db_fetchone(
-        "SELECT * FROM assets WHERE user_id=? AND id=?",
+        "SELECT * FROM assets WHERE user_id=$1 AND id=$2",
         (user_id, asset_id)
     )
 
 async def add_asset_row(user_id: int, symbol: str, coingecko_id: str, name: str,
                         invested_usd: float, entry_price: float) -> int:
     ts = int(time.time())
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
+    assert pg_pool is not None
+    async with pg_pool.acquire() as conn:
+        row = await conn.fetchrow(
             """
             INSERT INTO assets(user_id, symbol, coingecko_id, name, invested_usd, entry_price, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING id
             """,
-            (user_id, symbol.upper(), coingecko_id, name, invested_usd, entry_price, ts)
+            user_id, symbol.upper(), coingecko_id, name, invested_usd, entry_price, ts
         )
-        await db.commit()
-        return int(cur.lastrowid)
+        return int(row["id"])
 
 async def update_asset_row(user_id: int, asset_id: int, invested_usd: float, entry_price: float):
     await db_exec(
-        "UPDATE assets SET invested_usd=?, entry_price=? WHERE user_id=? AND id=?",
+        "UPDATE assets SET invested_usd=$1, entry_price=$2 WHERE user_id=$3 AND id=$4",
         (invested_usd, entry_price, user_id, asset_id)
     )
 
 async def delete_asset_row(user_id: int, asset_id: int):
-    await db_exec("DELETE FROM alerts WHERE asset_id=?", (asset_id,))
-    await db_exec("DELETE FROM assets WHERE user_id=? AND id=?", (user_id, asset_id))
+    # alerts удалятся сами из-за ON DELETE CASCADE, но оставим “явно” удаление assets
+    await db_exec("DELETE FROM assets WHERE user_id=$1 AND id=$2", (user_id, asset_id))
 
 async def replace_alerts(asset_id: int, alerts: List[Tuple[str, int, float]]):
-    await db_exec("DELETE FROM alerts WHERE asset_id=?", (asset_id,))
-    async with aiosqlite.connect(DB_PATH) as db:
-        for t, pct, target in alerts:
-            await db.execute(
-                "INSERT INTO alerts(asset_id, type, pct, target_price) VALUES (?, ?, ?, ?)",
-                (asset_id, t, pct, target)
-            )
-        await db.commit()
+    await db_exec("DELETE FROM alerts WHERE asset_id=$1", (asset_id,))
+    for t, pct, target in alerts:
+        await db_exec(
+            "INSERT INTO alerts(asset_id, type, pct, target_price) VALUES ($1, $2, $3, $4)",
+            (asset_id, t, pct, target)
+        )
 
 async def list_alerts_for_asset(asset_id: int):
-    return await db_fetchall("SELECT * FROM alerts WHERE asset_id=?", (asset_id,))
+    return await db_fetchall("SELECT * FROM alerts WHERE asset_id=$1", (asset_id,))
+
+async def recompute_alert_targets(asset_id: int, new_entry: float):
+    rows = await list_alerts_for_asset(asset_id)
+    updated: List[Tuple[str, int, float]] = []
+    for r in rows:
+        t = str(r["type"])
+        pct = int(r["pct"])
+        target = new_entry * (1 - pct / 100.0) if t == "RISK" else new_entry * (1 + pct / 100.0)
+        updated.append((t, pct, float(target)))
+    if updated:
+        await replace_alerts(asset_id, updated)
 
 async def pending_alerts_joined():
     return await db_fetchall(
@@ -448,7 +552,7 @@ async def pending_alerts_joined():
 
 async def mark_alert_triggered(alert_id: int):
     await db_exec(
-        "UPDATE alerts SET triggered=1, triggered_at=? WHERE id=?",
+        "UPDATE alerts SET triggered=1, triggered_at=$1 WHERE id=$2",
         (int(time.time()), alert_id)
     )
 
@@ -461,20 +565,20 @@ async def insert_snapshot(user_id: int, total_value: float, total_invested: floa
     await db_exec(
         """
         INSERT INTO pnl_snapshots(user_id, ts, total_value_usd, total_invested_usd, total_pnl_usd)
-        VALUES (?, ?, ?, ?, ?)
+        VALUES ($1, $2, $3, $4, $5)
         """,
         (user_id, int(time.time()), total_value, total_invested, pnl)
     )
 
 async def get_snapshot_latest(user_id: int):
     return await db_fetchone(
-        "SELECT * FROM pnl_snapshots WHERE user_id=? ORDER BY ts DESC LIMIT 1",
+        "SELECT * FROM pnl_snapshots WHERE user_id=$1 ORDER BY ts DESC LIMIT 1",
         (user_id,)
     )
 
 async def get_snapshot_at_or_before(user_id: int, ts_cutoff: int):
     return await db_fetchone(
-        "SELECT * FROM pnl_snapshots WHERE user_id=? AND ts <= ? ORDER BY ts DESC LIMIT 1",
+        "SELECT * FROM pnl_snapshots WHERE user_id=$1 AND ts <= $2 ORDER BY ts DESC LIMIT 1",
         (user_id, ts_cutoff)
     )
 
@@ -611,10 +715,11 @@ async def build_summary_text(user_id: int) -> str:
 
         IND = "\u00A0\u00A0"  # 2 неразрывных пробела для красивого отступа
 
+        line_invested = f"{IND}Вложено: {money_usd(comp.invested)}"
         line_qty = f"{IND}Кол-во монет: {qty_text}"
         line_alert = f"{IND}<b>{format_alert_line(risk_pcts, tp_pcts)}</b>"
 
-        blocks.append("\n".join([line_top, line_qty, line_alert]))
+        blocks.append("\n".join([line_top, line_invested, line_qty, line_alert]))
 
     footer_lines: List[str] = [
         f"Токены: {known}/{total_assets}",
@@ -974,6 +1079,7 @@ async def on_edit_entry(m: Message, state: FSMContext):
     entry = float(v)
 
     await update_asset_row(m.from_user.id, asset_id, invested, entry)
+    await recompute_alert_targets(asset_id, entry)
     await state.clear()
     await m.answer("Обновил ✅", reply_markup=main_menu_kb())
 
@@ -1048,7 +1154,7 @@ async def alerts_loop(bot: Bot):
                     move_text = f"Цена снизилась на {pct}%" if t == "RISK" else f"Цена увеличилась на {pct}%"
 
                     text = "\n".join([
-                        f"🔔 АЛЕРТ: <b>{escape(sym)}</b>",
+                        f"<b>🔔 АЛЕРТ: {escape(sym)}</b>",
                         f"{move_icon} {move_text}",
                         f"Текущая цена: {fmt_price(float(current))}",
                         f"{pnl_icon(pnl_usd)} PNL сейчас: {sign_money(pnl_usd)} ({sign_pct(pnl_pct)})",
@@ -1072,6 +1178,10 @@ async def snapshots_loop():
 
                 ids = list({a["coingecko_id"] for a in assets})
                 price_map = await cg.simple_prices_usd(ids)
+                known = sum(1 for cid in ids if cid in price_map)
+                if known != len(ids):
+                    log.warning("Skip snapshot for uid=%s: prices coverage %d/%d", uid, known, len(ids))
+                    continue
 
                 total_invested = 0.0
                 total_value = 0.0
@@ -1095,7 +1205,7 @@ async def snapshots_loop():
 async def main():
     await init_db()
     log.info("CWD=%s", os.getcwd())
-    log.info("DB_PATH=%s exists=%s", DB_PATH, os.path.exists(DB_PATH))
+    log.info("DB_BACKEND=%s", DB_BACKEND)
 
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     await bot.delete_webhook(drop_pending_updates=True)
@@ -1113,6 +1223,8 @@ async def main():
         for t in (health_task, alert_task, snap_task):
             t.cancel()
         await cg.close()
+        if pg_pool is not None:
+            await pg_pool.close()
 
 
 if __name__ == "__main__":
