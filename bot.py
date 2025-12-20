@@ -409,8 +409,6 @@ CREATE TABLE IF NOT EXISTS assets (
   created_at BIGINT NOT NULL
 );
 
-ALTER TABLE assets ADD COLUMN IF NOT EXISTS qty_override DOUBLE PRECISION;
-
 CREATE INDEX IF NOT EXISTS idx_assets_user ON assets(user_id);
 CREATE INDEX IF NOT EXISTS idx_assets_cgid ON assets(coingecko_id);
 
@@ -449,25 +447,57 @@ async def init_db():
         min_size=1,
         max_size=PG_POOL_SIZE,
         command_timeout=30,
+        statement_cache_size=0,  # FIX: не кешируем prepared statements
     )
     async with pg_pool.acquire() as conn:
         await conn.execute(SCHEMA_SQL)
 
+        # MIGRATION: для старых БД, где assets уже есть без qty_override
+        try:
+            await conn.execute("ALTER TABLE assets ADD COLUMN IF NOT EXISTS qty_override DOUBLE PRECISION;")
+        except Exception:
+            log.exception("Migration failed: ALTER TABLE assets ADD COLUMN qty_override")
+            raise
+
 async def db_exec(sql: str, params: tuple = ()):
     assert pg_pool is not None
     async with pg_pool.acquire() as conn:
-        await conn.execute(sql, *params)
+        try:
+            await conn.execute(sql, *params)
+            return
+        except asyncpg.exceptions.InvalidCachedStatementError:
+            # FIX: протухший cached plan после DDL/ALTER/настроек
+            try:
+                await conn.reload_schema_state()
+            except Exception:
+                pass
+            await conn.execute(sql, *params)
+            return
 
 async def db_fetchone(sql: str, params: tuple = ()):
     assert pg_pool is not None
     async with pg_pool.acquire() as conn:
-        row = await conn.fetchrow(sql, *params)
+        try:
+            row = await conn.fetchrow(sql, *params)
+        except asyncpg.exceptions.InvalidCachedStatementError:
+            try:
+                await conn.reload_schema_state()
+            except Exception:
+                pass
+            row = await conn.fetchrow(sql, *params)
         return dict(row) if row else None
 
 async def db_fetchall(sql: str, params: tuple = ()):
     assert pg_pool is not None
     async with pg_pool.acquire() as conn:
-        rows = await conn.fetch(sql, *params)
+        try:
+            rows = await conn.fetch(sql, *params)
+        except asyncpg.exceptions.InvalidCachedStatementError:
+            try:
+                await conn.reload_schema_state()
+            except Exception:
+                pass
+            rows = await conn.fetch(sql, *params)
         return [dict(r) for r in rows]
 
 async def upsert_user(user_id: int):
@@ -498,21 +528,24 @@ async def add_asset_row(user_id: int, symbol: str, coingecko_id: str, name: str,
                         invested_usd: float, entry_price: float,
                         qty_override: Optional[float] = None) -> int:
     ts = int(time.time())
-    assert pg_pool is not None
-    async with pg_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO assets(
-                user_id, symbol, coingecko_id, name,
-                invested_usd, entry_price, qty_override, created_at
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            RETURNING id
-            """,
-            user_id, symbol.upper(), coingecko_id, name,
-            invested_usd, entry_price, qty_override, ts
+
+    row = await db_fetchone(
+        """
+        INSERT INTO assets(
+            user_id, symbol, coingecko_id, name,
+            invested_usd, entry_price, qty_override, created_at
         )
-        return int(row["id"])
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        RETURNING id
+        """,
+        (user_id, symbol.upper(), coingecko_id, name,
+         invested_usd, entry_price, qty_override, ts)
+    )
+
+    if not row or "id" not in row:
+        raise RuntimeError("add_asset_row: INSERT succeeded but no id returned")
+
+    return int(row["id"])
 
 async def update_asset_row(user_id: int, asset_id: int,
                            invested_usd: float, entry_price: float,
@@ -760,7 +793,7 @@ async def build_summary_text(user_id: int) -> str:
     else:
         footer_lines.append(f"Текущая стоимость: {money_usd(total_value)}")
         total_pnl = total_value - total_invested
-        total_pnl_pct = None if total_inвестed == 0 else (total_pnl / total_invested * 100.0)
+        total_pnl_pct = None if total_invested == 0 else (total_pnl / total_invested * 100.0)
         pct_text = "—" if total_pnl_pct is None else sign_pct(total_pnl_pct)
         footer_lines.append(
             f"<b>{pnl_icon(total_pnl)} ОБЩИЙ PNL: {sign_money(total_pnl)} ({pct_text})</b>"
@@ -1267,12 +1300,6 @@ async def alerts_loop(bot: Bot):
                         f"Текущая цена: {fmt_price(float(current))}",
                         f"{pnl_icon(pnl_usd)} PNL сейчас: {sign_money(pnl_usd)} ({pct_text})",
                     ])
-
-                    pct = int(r["pct"])
-                    sym = str(r["symbol"] or "")
-
-                    move_icon = "🔴" if t == "RISK" else "🟢"
-                    move_text = f"Цена снизилась на {pct}%" if t == "RISK" else f"Цена увеличилась на {pct}%"
 
                     await bot.send_message(chat_id=int(r["user_id"]), text=text)
                     await mark_alert_triggered(int(r["alert_id"]))
