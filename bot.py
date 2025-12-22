@@ -63,6 +63,8 @@ if DB_BACKEND == "postgres" and not DATABASE_URL:
 
 RISK_LEVELS = [5, 10, 25]
 TP_LEVELS = [5, 10, 25]
+ALERT_REARM_PCT = float(os.getenv("ALERT_REARM_PCT", "0.3"))
+# 0.3% = небольшой запас, чтобы алерт не “дребезжал” туда-сюда вокруг target
 
 async def run_health_server():
     app = web.Application()
@@ -573,6 +575,67 @@ async def list_assets(user_id: int):
         (user_id,)
     )
 
+async def list_assets_with_alerts(user_id: int) -> Tuple[List[dict], Dict[int, List[dict]]]:
+    """
+    Один запрос вместо двух:
+    - забираем assets пользователя
+    - и сразу приклеиваем к каждому asset его alerts (LEFT JOIN)
+    Это экономит одну “поездку” (сетевую задержку) до Neon.
+    """
+    rows = await db_fetchall(
+        """
+        SELECT
+          a.id AS asset_id,
+          a.user_id,
+          a.symbol,
+          a.coingecko_id,
+          a.name,
+          a.invested_usd,
+          a.entry_price,
+          a.qty_override,
+          a.created_at,
+
+          al.type AS alert_type,
+          al.pct  AS alert_pct
+
+        FROM assets a
+        LEFT JOIN alerts al ON al.asset_id = a.id
+        WHERE a.user_id=$1
+        ORDER BY a.id DESC
+        """,
+        (user_id,)
+    )
+
+    assets_by_id: Dict[int, dict] = {}
+    alerts_by_asset: Dict[int, List[dict]] = {}
+
+    for r in rows:
+        aid = int(r["asset_id"])
+
+        if aid not in assets_by_id:
+            assets_by_id[aid] = {
+                "id": aid,
+                "user_id": int(r["user_id"]),
+                "symbol": str(r["symbol"]),
+                "coingecko_id": str(r["coingecko_id"]),
+                "name": r.get("name") or "",
+                "invested_usd": float(r["invested_usd"]),
+                "entry_price": float(r["entry_price"]),
+                "qty_override": r.get("qty_override"),
+                "created_at": int(r["created_at"]),
+            }
+
+        at = r.get("alert_type")
+        ap = r.get("alert_pct")
+        if at is not None and ap is not None:
+            alerts_by_asset.setdefault(aid, []).append({
+                "type": str(at),
+                "pct": int(ap),
+            })
+
+    assets = sorted(assets_by_id.values(), key=lambda x: x["id"], reverse=True)
+    return assets, alerts_by_asset
+
 async def get_asset(user_id: int, asset_id: int):
     return await db_fetchone(
         "SELECT * FROM assets WHERE user_id=$1 AND id=$2",
@@ -645,13 +708,12 @@ async def pending_alerts_joined():
     return await db_fetchall(
         """
         SELECT
-  	 al.id AS alert_id, al.type, al.pct, al.target_price,
-  	 a.id AS asset_id, a.user_id, a.symbol, a.coingecko_id, a.name,
-  	 a.invested_usd, a.entry_price, a.qty_override
-
+          al.id AS alert_id, al.type, al.pct, al.target_price,
+          al.triggered, al.triggered_at,
+          a.id AS asset_id, a.user_id, a.symbol, a.coingecko_id, a.name,
+          a.invested_usd, a.entry_price, a.qty_override
         FROM alerts al
         JOIN assets a ON a.id = al.asset_id
-        WHERE al.triggered = 0
         """
     )
 
@@ -660,6 +722,9 @@ async def mark_alert_triggered(alert_id: int):
         "UPDATE alerts SET triggered=1, triggered_at=$1 WHERE id=$2",
         (int(time.time()), alert_id)
     )
+
+async def reset_alert_triggered(alert_id: int):
+    await db_exec("UPDATE alerts SET triggered=0, triggered_at=NULL WHERE id=$1", (alert_id,))
 
 async def all_users() -> List[int]:
     rows = await db_fetchall("SELECT user_id FROM users")
@@ -705,7 +770,12 @@ def compute_asset(row, current_price: Optional[float]) -> AssetComputed:
     invested = float(row["invested_usd"])
     entry = float(row["entry_price"])
     qty_override = float(row.get("qty_override") or 0.0)
-    qty = invested / entry if entry > 0 else qty_override
+    if qty_override > 0:
+        qty = qty_override
+    elif entry > 0:
+        qty = invested / entry
+    else:
+        qty = 0.0
 
     if current_price is None:
         return AssetComputed(
@@ -779,7 +849,7 @@ def asset_card(comp: AssetComputed, risk_pcts: List[int], tp_pcts: List[int]) ->
     ])
 
 async def build_summary_text(user_id: int) -> str:
-    assets = await list_assets(user_id)
+    assets, alerts_by_asset = await list_assets_with_alerts(user_id)
     if not assets:
         return (
             "📊 <b>Сводка портфеля</b>\n\n"
@@ -815,28 +885,47 @@ async def build_summary_text(user_id: int) -> str:
 
     blocks: List[str] = []
     for comp in computed:
-        alerts = await list_alerts_for_asset(comp.asset_id)
-        risk_pcts = sorted({int(r["pct"]) for r in alerts if r["type"] == "RISK"})
-        tp_pcts = sorted({int(r["pct"]) for r in alerts if r["type"] == "TP"})
+        alerts = alerts_by_asset.get(comp.asset_id, []) or []
+        risk_pcts = sorted({int(r["pct"]) for r in alerts if r.get("type") == "RISK"})
+        tp_pcts = sorted({int(r["pct"]) for r in alerts if r.get("type") == "TP"})
 
         sym = escape(comp.symbol)
         qty_text = fmt_qty(comp.qty)
 
-        if comp.current is None or comp.pnl_usd is None:
-            line_top = f"• <b>{sym}</b> · PNL —"
-        else:
-            icon = pnl_icon(comp.pnl_usd)
-            pct_text = "—" if comp.pnl_pct is None else sign_pct(comp.pnl_pct)
-            line_top = f"• <b>{sym}</b> · {icon} {sign_money(comp.pnl_usd)} ({pct_text})"
-
         IND = "\u00A0\u00A0"  # 2 неразрывных пробела для красивого отступа
 
-        line_invested = f"{IND}Вложено: {money_usd(comp.invested)}"
+        # FREE позиции (invested=0): показываем стоимость и Δ от entry (цены получения)
+        if comp.invested == 0:
+            if comp.current is None:
+                line_top = f"• <b>{sym}</b> · Стоимость —"
+                line_mid = f"{IND}Δ от входа: —"
+            else:
+                current_value = comp.qty * float(comp.current)
+                line_top = f"• <b>{sym}</b> · Стоимость {money_usd(current_value)}"
+
+                if comp.entry > 0 and comp.qty > 0:
+                    base_value = comp.qty * comp.entry
+                    delta_usd = current_value - base_value
+                    delta_pct = None if base_value == 0 else (delta_usd / base_value * 100.0)
+                    pct_text = "—" if delta_pct is None else sign_pct(delta_pct)
+                    line_mid = f"{IND}Δ от входа: {sign_money(delta_usd)} ({pct_text})"
+                else:
+                    line_mid = f"{IND}Δ от входа: —"
+
+        # Обычные позиции: старый формат PNL от вложенной суммы
+        else:
+            if comp.current is None or comp.pnl_usd is None:
+                line_top = f"• <b>{sym}</b> · PNL —"
+            else:
+                icon = pnl_icon(comp.pnl_usd)
+                pct_text = "—" if comp.pnl_pct is None else sign_pct(comp.pnl_pct)
+                line_top = f"• <b>{sym}</b> · {icon} {sign_money(comp.pnl_usd)} ({pct_text})"
+            line_mid = f"{IND}Вложено: {money_usd(comp.invested)}"
+
         line_qty = f"{IND}Кол-во монет: {qty_text}"
         line_alert = f"{IND}<b>{format_alert_line(risk_pcts, tp_pcts)}</b>"
 
-        blocks.append("\n".join([line_top, line_invested, line_qty, line_alert]))
-
+        blocks.append("\n".join([line_top, line_mid, line_qty, line_alert]))
     footer_lines: List[str] = [
         f"Токены: {known}/{total_assets}",
         f"Вложено: {money_usd(total_invested)}",
@@ -857,6 +946,7 @@ async def build_summary_text(user_id: int) -> str:
     return "📊 <b>Сводка портфеля</b>\n\n" + "\n\n".join(blocks) + "\n\n" + "\n".join(footer_lines)
 # ---------------------------- FSM ----------------------------
 class AddAssetFSM(StatesGroup):
+    mode = State()
     ticker = State()
     choose_coin = State()
     invested = State()
@@ -871,6 +961,13 @@ class EditAssetFSM(StatesGroup):
     quantity = State()
 
 # ---------------------------- keyboards for flows ----------------------------
+def add_mode_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Обычная позиция", callback_data="add:mode:paid")],
+        [InlineKeyboardButton(text="Бесплатная позиция", callback_data="add:mode:free")],
+        [InlineKeyboardButton(text="Отмена", callback_data="flow:cancel")],
+    ])
+
 def coin_choice_kb(coins: List[dict]) -> InlineKeyboardMarkup:
     kb = []
     for c in coins[:6]:
@@ -920,6 +1017,29 @@ def assets_list_kb(assets_rows, prefix: str) -> InlineKeyboardMarkup:
     kb.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="nav:menu")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
+def assets_edit_list_kb(assets_rows) -> InlineKeyboardMarkup:
+    kb = []
+    for a in assets_rows:
+        kb.append([
+            InlineKeyboardButton(
+                text=f"✏️ {a['symbol']} — {fmt_usd(a['invested_usd'])} @ {fmt_usd(a['entry_price'])}",
+                callback_data=f"edit:asset:{a['id']}"
+            ),
+            InlineKeyboardButton(
+                text="🗑",
+                callback_data=f"edit:delete:{a['id']}"
+            )
+        ])
+    kb.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="nav:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def edit_actions_kb(asset_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Удалить этот актив", callback_data=f"edit:delete:{asset_id}")],
+        [InlineKeyboardButton(text="⬅️ К списку", callback_data="nav:edit"),
+         InlineKeyboardButton(text="⬅️ В меню", callback_data="nav:menu")]
+    ])
+
 # ---------------------------- router/handlers ----------------------------
 router = Router()
 
@@ -942,18 +1062,20 @@ async def on_summary(m: Message):
 @router.callback_query(F.data == "summary:refresh")
 async def on_summary_refresh(cb: CallbackQuery):
     await upsert_user(cb.from_user.id)
-    text = await build_summary_text(cb.from_user.id)
 
-    # Если текст уже такой же — просто отвечаем, без edit_text
+    # один ответ на callback — сразу закрываем “спиннер” (важно для телефона)
+    await cb.answer("Обновляю...")
+
+    t0 = time.perf_counter()
+    text = await build_summary_text(cb.from_user.id)
+    log.info("summary_refresh uid=%s took %.3fs", cb.from_user.id, time.perf_counter() - t0)
+
     try:
         await cb.message.edit_text(text, reply_markup=summary_kb())
     except TelegramBadRequest as e:
-        # Telegram ругается, если "ничего не поменялось"
         if "message is not modified" in str(e):
-            return await cb.answer("Уже актуально")
+            return
         raise
-
-    await cb.answer("Обновлено")
 
 @router.callback_query(F.data == "nav:menu")
 async def on_nav_menu(cb: CallbackQuery, state: FSMContext):
@@ -963,17 +1085,18 @@ async def on_nav_menu(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "nav:add")
 async def on_nav_add(cb: CallbackQuery, state: FSMContext):
+    await upsert_user(cb.from_user.id)
     await state.clear()
-    await state.set_state(AddAssetFSM.ticker)
-    await cb.message.answer("Введи тикер/название монеты (пример: BTC, ETH, solana):")
+    await state.set_state(AddAssetFSM.mode)
+    await cb.message.answer("Выбери тип позиции:", reply_markup=add_mode_kb())
     await cb.answer()
 
 @router.message(F.text == "➕ Добавить актив")
 async def on_add_asset_start(m: Message, state: FSMContext):
     await upsert_user(m.from_user.id)
     await state.clear()
-    await state.set_state(AddAssetFSM.ticker)
-    await m.answer("Введи тикер/название монеты (пример: BTC, ETH, solana):")
+    await state.set_state(AddAssetFSM.mode)
+    await m.answer("Выбери тип позиции:", reply_markup=add_mode_kb())
 
 @router.message(AddAssetFSM.ticker)
 async def on_add_ticker(m: Message, state: FSMContext):
@@ -1011,19 +1134,50 @@ async def on_add_choose_coin(cb: CallbackQuery, state: FSMContext):
         await state.clear()
         return
 
+    mode = (data.get("add_mode") or "paid").strip().lower()
+
     await state.update_data(
         coingecko_id=chosen["id"],
         symbol=(chosen.get("symbol") or "").upper(),
         name=chosen.get("name") or ""
     )
+
+    if mode == "free":
+        await state.update_data(invested=0.0)
+        await state.set_state(AddAssetFSM.entry)
+        await cb.message.answer(
+            "Бесплатная позиция.\n"
+            "Введи цену, по которой досталась монета (USD). Можно 0:"
+        )
+        await cb.answer()
+        return
+
     await state.set_state(AddAssetFSM.invested)
-    await cb.message.answer("Введи сумму, на которую купил (в USD), например 1000:")
+    await cb.message.answer("Введи сумму, на которую купил (в USD). Например 1000:")
     await cb.answer()
 
 @router.callback_query(F.data == "flow:cancel")
 async def on_flow_cancel(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.message.answer("Ок, отменил.", reply_markup=main_menu_kb())
+    await cb.answer()
+
+@router.callback_query(AddAssetFSM.mode, F.data.startswith("add:mode:"))
+async def on_add_mode(cb: CallbackQuery, state: FSMContext):
+    mode = cb.data.split("add:mode:", 1)[1].strip().lower()
+    if mode not in ("paid", "free"):
+        return await cb.answer("Не понял")
+
+    await state.update_data(add_mode=mode)
+    await state.set_state(AddAssetFSM.ticker)
+
+    # Убираем клавиатуру, чтобы не нажимали второй раз и не было “вечной загрузки” в клиенте
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await cb.message.answer("Введи тикер/название монеты (пример: BTC, ETH, SOL):")
     await cb.answer()
 
 @router.message(AddAssetFSM.invested)
@@ -1042,20 +1196,23 @@ async def on_add_entry(m: Message, state: FSMContext):
         return await m.answer("Цена входа не может быть отрицательной.")
 
     entry = float(v)
+    data = await state.get_data()
+    invested = float(data.get("invested", 0.0))
+
     await state.update_data(entry=entry)
 
-    if entry == 0:
+    # Если сумму/цену нельзя использовать для auto-qty — вводим количество вручную
+    if invested == 0 or entry == 0:
         await state.set_state(AddAssetFSM.quantity)
         return await m.answer(
-            "Это бесплатная позиция.\n"
-            "Введи количество монет (например 123.4567):"
+            "Введи количество монет (например 123.4567):\n"
+            "Если сумма = 0, то entry будет использоваться как база для алертов."
         )
 
     await state.update_data(selected_alerts=set(), qty_override=None)
-    data = await state.get_data()
+
     sym = data.get("symbol", "")
     nm = data.get("name", "")
-    invested = float(data["invested"])
 
     preview = "\n".join([
         f"Ок, добавляем: {sym} ({nm})",
@@ -1073,30 +1230,46 @@ async def on_add_quantity(m: Message, state: FSMContext):
     if qty is None or qty <= 0:
         return await m.answer("Количество должно быть больше нуля.")
 
+    await state.update_data(qty_override=float(qty))
+
     data = await state.get_data()
     sym = (data.get("symbol") or "").upper()
     nm = data.get("name") or ""
     coingecko_id = data.get("coingecko_id")
-    invested = float(data.get("invested"))
-    entry = float(data.get("entry"))
+    invested = float(data.get("invested", 0.0))
+    entry = float(data.get("entry", 0.0))
     qty_override = float(qty)
 
-    await add_asset_row(
-        m.from_user.id,
-        sym,
-        coingecko_id,
-        nm,
-        invested,
-        entry,
-        qty_override=qty_override,
-    )
-    await state.clear()
-    await m.answer(
-        "Готово ✅ Бесплатная позиция сохранена.\n"
-        "Алерты по процентам для неё недоступны.",
-        reply_markup=main_menu_kb()
-    )
+    # Если entry <= 0 — алерты бессмысленны, сохраняем сразу
+    if entry <= 0:
+        await add_asset_row(
+            m.from_user.id,
+            sym,
+            coingecko_id,
+            nm,
+            invested,
+            entry,
+            qty_override=qty_override,
+        )
+        await state.clear()
+        return await m.answer(
+            "Готово ✅ Позиция сохранена.\n"
+            "Алерты по процентам недоступны при цене входа 0.",
+            reply_markup=main_menu_kb()
+        )
 
+    # entry > 0: можно алерты
+    await state.update_data(selected_alerts=set())
+    preview = "\n".join([
+        f"Ок, добавляем: {sym} ({nm})",
+        f"Сумма: {fmt_usd(invested)}",
+        f"Цена входа: {fmt_usd(entry)}",
+        f"Количество: {fmt_qty(qty_override)}",
+        "",
+        "Выбери алерты (можно несколько) и нажми «💾 Готово»:"
+    ])
+    await state.set_state(AddAssetFSM.alerts)
+    await m.answer(preview, reply_markup=alerts_kb(set()))
 @router.callback_query(AddAssetFSM.alerts, F.data.startswith("add:alert:"))
 async def on_add_alerts(cb: CallbackQuery, state: FSMContext):
     action = cb.data.split("add:alert:", 1)[1]
@@ -1114,12 +1287,18 @@ async def on_add_alerts(cb: CallbackQuery, state: FSMContext):
         sym = (data.get("symbol") or "").upper()
         nm = data.get("name") or ""
         coingecko_id = data.get("coingecko_id")
-        invested = float(data.get("invested"))
-        entry = float(data.get("entry"))
+        invested = float(data.get("invested", 0.0))
+        entry = float(data.get("entry", 0.0))
 
-        if entry == 0:
-            await cb.answer("Для бесплатной позиции алерты не сохраняются.")
-            return
+        qo = data.get("qty_override")
+        qty_override: Optional[float] = None
+        if qo is not None:
+            try:
+                qty_override = float(qo)
+            except Exception:
+                qty_override = None
+            if qty_override is not None and qty_override <= 0:
+                qty_override = None
 
         asset_id = await add_asset_row(
             cb.from_user.id,
@@ -1128,15 +1307,16 @@ async def on_add_alerts(cb: CallbackQuery, state: FSMContext):
             nm,
             invested,
             entry,
-            qty_override=None,
+            qty_override=qty_override,
         )
 
         alert_rows: List[Tuple[str, int, float]] = []
-        for s in sorted(selected):
-            t, pct_str = s.split(":")
-            pct = int(pct_str)
-            target = entry * (1 - pct / 100.0) if t == "RISK" else entry * (1 + pct / 100.0)
-            alert_rows.append((t, pct, float(target)))
+        if entry > 0:
+            for s in sorted(selected):
+                t, pct_str = s.split(":")
+                pct = int(pct_str)
+                target = entry * (1 - pct / 100.0) if t == "RISK" else entry * (1 + pct / 100.0)
+                alert_rows.append((t, pct, float(target)))
 
         if alert_rows:
             await replace_alerts(asset_id, alert_rows)
@@ -1193,7 +1373,11 @@ async def on_edit_menu(m: Message, state: FSMContext):
         return await m.answer("Активов пока нет — редактировать нечего.", reply_markup=main_menu_kb())
     await state.clear()
     await state.set_state(EditAssetFSM.choose_asset)
-    await m.answer("Выбери актив для редактирования:", reply_markup=assets_list_kb(assets, "edit"))
+    await m.answer(
+        "Выбери актив:\n"
+        "✏️ — редактировать, 🗑 — удалить",
+        reply_markup=assets_edit_list_kb(assets)
+    )
 
 @router.callback_query(F.data == "nav:edit")
 async def on_edit_menu_cb(cb: CallbackQuery, state: FSMContext):
@@ -1203,8 +1387,40 @@ async def on_edit_menu_cb(cb: CallbackQuery, state: FSMContext):
         return await cb.answer()
     await state.clear()
     await state.set_state(EditAssetFSM.choose_asset)
-    await cb.message.answer("Выбери актив для редактирования:", reply_markup=assets_list_kb(assets, "edit"))
+    await cb.message.answer(
+        "Выбери актив:\n"
+        "✏️ — редактировать, 🗑 — удалить",
+        reply_markup=assets_edit_list_kb(assets)
+    )
     await cb.answer()
+
+@router.callback_query(F.data.startswith("edit:delete:"))
+async def on_edit_delete_asset(cb: CallbackQuery, state: FSMContext):
+    try:
+        asset_id = int(cb.data.split("edit:delete:", 1)[1])
+    except Exception:
+        return await cb.answer("Некорректный id")
+
+    a = await get_asset(cb.from_user.id, asset_id)
+    if not a:
+        return await cb.answer("Актив не найден")
+
+    await delete_asset_row(cb.from_user.id, asset_id)
+
+    assets = await list_assets(cb.from_user.id)
+    if not assets:
+        await state.clear()
+        await cb.message.answer(f"Удалил {a['symbol']} ✅\nАктивов больше нет.", reply_markup=main_menu_kb())
+        await cb.answer("Удалено")
+        return
+
+    await state.clear()
+    await state.set_state(EditAssetFSM.choose_asset)
+    await cb.message.answer(
+        f"Удалил {a['symbol']} ✅\n\nВыбери следующий актив:",
+        reply_markup=assets_edit_list_kb(assets)
+    )
+    await cb.answer("Удалено")
 
 @router.callback_query(EditAssetFSM.choose_asset, F.data.startswith("edit:asset:"))
 async def on_edit_choose(cb: CallbackQuery, state: FSMContext):
@@ -1223,19 +1439,20 @@ async def on_edit_choose(cb: CallbackQuery, state: FSMContext):
             f"Текущая сумма: {fmt_usd(a['invested_usd'])}",
             f"Текущая цена входа: {fmt_usd(a['entry_price'])}",
             "",
-            "Введи новую сумму (USD):"
-        ])
+            "Введи новую сумму (USD). Можно 0 для бесплатной позиции:"
+        ]),
+        reply_markup=edit_actions_kb(asset_id)
     )
     await cb.answer()
 
 @router.message(EditAssetFSM.invested)
 async def on_edit_invested(m: Message, state: FSMContext):
     v = safe_float(m.text or "")
-    if v is None or v <= 0:
-        return await m.answer("Введи положительное число.")
+    if v is None or v < 0:
+        return await m.answer("Сумма не может быть отрицательной. Можно 0 для бесплатной позиции.")
     await state.update_data(invested=float(v))
     await state.set_state(EditAssetFSM.entry)
-    await m.answer("Введи новую цену входа (USD):")
+    await m.answer("Введи новую цену входа (USD). Можно 0, если хочешь ввести количество вручную:")
 
 @router.message(EditAssetFSM.entry)
 async def on_edit_entry(m: Message, state: FSMContext):
@@ -1246,10 +1463,12 @@ async def on_edit_entry(m: Message, state: FSMContext):
     entry = float(v)
     data = await state.get_data()
     asset_id = int(data["asset_id"])
-    invested = float(data["invested"])
+    invested = float(data.get("invested", 0.0))
 
-    if entry == 0:
-        await state.update_data(entry=entry)
+    await state.update_data(entry=entry)
+
+    # Если qty нельзя адекватно посчитать как invested/entry — просим количество
+    if invested == 0 or entry == 0:
         await state.set_state(EditAssetFSM.quantity)
         return await m.answer("Введи количество монет для позиции (например 12.34):")
 
@@ -1314,50 +1533,78 @@ async def on_pnl_period(m: Message):
 
 # ---------------------------- background loops ----------------------------
 async def alerts_loop(bot: Bot):
+    rearm_frac = max(0.0, ALERT_REARM_PCT) / 100.0
+
     while True:
         try:
             rows = await pending_alerts_joined()
             if rows:
-                ids = list({r["coingecko_id"] for r in rows})
+                ids = list({r["coingecko_id"] for r in rows if r.get("coingecko_id")})
                 price_map = await cg.simple_prices_usd(ids)
 
                 for r in rows:
-                    current = price_map.get(r["coingecko_id"])
+                    cid = r.get("coingecko_id")
+                    current = price_map.get(cid)
                     if current is None:
                         continue
 
-                    t = r["type"]  # RISK/TP
+                    cur = float(current)
+                    t = str(r.get("type") or "")
                     target = float(r["target_price"])
-                    hit = (float(current) <= target) if t == "RISK" else (float(current) >= target)
-                    if not hit:
+                    triggered = int(r.get("triggered") or 0)
+                    alert_id = int(r["alert_id"])
+
+                    hit = (cur <= target) if t == "RISK" else (cur >= target)
+
+                    # 1) Если “попали в зону” и алерт был вооружён — шлём и ставим triggered=1
+                    if hit and triggered == 0:
+                        invested = float(r["invested_usd"])
+                        entry = float(r["entry_price"])
+                        qty_override = float(r.get("qty_override") or 0.0)
+                        if qty_override > 0:
+                            qty = qty_override
+                        elif entry > 0:
+                            qty = invested / entry
+                        else:
+                            qty = 0.0
+                        if qty == 0:
+                            continue
+
+                        pnl_usd = qty * cur - invested
+                        pnl_pct = None if invested == 0 else (pnl_usd / invested * 100.0)
+                        pct_text = "—" if pnl_pct is None else sign_pct(pnl_pct)
+
+                        pct = int(r["pct"])
+                        sym = str(r["symbol"] or "")
+
+                        move_icon = "🔴" if t == "RISK" else "🟢"
+                        move_text = f"Цена снизилась на {pct}%" if t == "RISK" else f"Цена увеличилась на {pct}%"
+
+                        text = "\n".join([
+                            f"<b>🔔 АЛЕРТ: {escape(sym)}</b>",
+                            f"{move_icon} {move_text}",
+                            f"Текущая цена: {fmt_price(cur)}",
+                            f"{pnl_icon(pnl_usd)} PNL сейчас: {sign_money(pnl_usd)} ({pct_text})",
+                        ])
+
+                        await bot.send_message(chat_id=int(r["user_id"]), text=text)
+                        await mark_alert_triggered(alert_id)
                         continue
 
-                    invested = float(r["invested_usd"])
-                    entry = float(r["entry_price"])
-                    qty_override = float(r.get("qty_override") or 0.0)
-                    qty = invested / entry if entry > 0 else qty_override
-                    if qty == 0:
-                        continue
+                    # 2) Если “вышли из зоны” и алерт был triggered=1 — пере-вооружаем
+                    if (not hit) and triggered == 1:
+                        if rearm_frac <= 0:
+                            await reset_alert_triggered(alert_id)
+                        else:
+                            if t == "RISK":
+                                # rearm когда цена восстановилась выше target на rearm_pct
+                                if cur >= target * (1.0 + rearm_frac):
+                                    await reset_alert_triggered(alert_id)
+                            else:
+                                # TP: rearm когда цена упала ниже target на rearm_pct
+                                if cur <= target * (1.0 - rearm_frac):
+                                    await reset_alert_triggered(alert_id)
 
-                    pnl_usd = qty * float(current) - invested
-                    pnl_pct = None if invested == 0 else (pnl_usd / invested * 100.0)
-                    pct_text = "—" if pnl_pct is None else sign_pct(pnl_pct)
-
-                    pct = int(r["pct"])
-                    sym = str(r["symbol"] or "")
-
-                    move_icon = "🔴" if t == "RISK" else "🟢"
-                    move_text = f"Цена снизилась на {pct}%" if t == "RISK" else f"Цена увеличилась на {pct}%"
-
-                    text = "\n".join([
-                        f"<b>🔔 АЛЕРТ: {escape(sym)}</b>",
-                        f"{move_icon} {move_text}",
-                        f"Текущая цена: {fmt_price(float(current))}",
-                        f"{pnl_icon(pnl_usd)} PNL сейчас: {sign_money(pnl_usd)} ({pct_text})",
-                    ])
-
-                    await bot.send_message(chat_id=int(r["user_id"]), text=text)
-                    await mark_alert_triggered(int(r["alert_id"]))
         except Exception as e:
             log.exception("alerts_loop error: %r", e)
 
@@ -1385,7 +1632,12 @@ async def snapshots_loop():
                     invested = float(a["invested_usd"])
                     entry = float(a["entry_price"])
                     qty_override = float(a.get("qty_override") or 0.0)
-                    qty = invested / entry if entry > 0 else qty_override
+                    if qty_override > 0:
+                        qty = qty_override
+                    elif entry > 0:
+                        qty = invested / entry
+                    else:
+                        qty = 0.0
                     if qty == 0:
                         continue
                     total_invested += invested
