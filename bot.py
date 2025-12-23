@@ -972,7 +972,14 @@ async def build_summary_text(user_id: int) -> str:
             f"<b>{pnl_icon(total_pnl)} ОБЩИЙ PNL: {sign_money(total_pnl)} ({pct_text})</b>"
         )
 
-    footer_lines.append(f"Обновлено: {ts_text}, источник: CoinGecko, TTL: {price_ttl}s")
+    footer_lines.append("_________________________________________________________")
+    footer_lines.extend([
+        "🛠Дополнительно:",
+        f"⌚️Обновлено: {ts_text}",
+        f"⌛️TTL: {price_ttl}s",
+        "📞/about",
+        "❓/help",
+    ])
 
     return "📊 <b>Сводка портфеля</b>\n\n" + "\n\n".join(blocks) + "\n\n" + "\n".join(footer_lines)
 
@@ -1108,9 +1115,9 @@ async def on_help(m: Message):
 async def on_about(m: Message):
     await m.answer(
         f"Версия бота: {VERSION}\n"
-        "Источник цен: CoinGecko (free tier)\n"
-        "Автор: you\n"
-        "Репо: https://github.com/your/repo"
+        "Источник цен: CoinGecko (FREE)\n"
+        "Автор: @playerholygrail\n"
+        "Репо: https://github.com/oxcivoul/asset_bot"
     )
 
 @router.message(F.text == "📊 Сводка")
