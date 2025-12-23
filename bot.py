@@ -184,14 +184,14 @@ class CoinGeckoClient:
         # NEW: limiter (simple spacing between requests)
         self._rl_lock = asyncio.Lock()
         self._last_request_ts = 0.0
-        self._min_interval_sec = float(os.getenv("COINGECKO_MIN_INTERVAL_SEC", "1.2"))
-        # 0.35s ~= до ~170 req/min в "идеале"; для free-tier можно и 0.6-1.0
+        self._min_interval_sec = float(os.getenv("COINGECKO_MIN_INTERVAL_SEC", "0.8"))
+        # 0.8–1.0 сек — быстрее ответа, но всё ещё щадяще для free-tier
 
         # NEW: adaptive backoff (when CoinGecko returns 429)
         self._base_min_interval_sec = self._min_interval_sec
         self._penalty_until_ts = 0.0
         self._penalty_min_interval_sec = self._min_interval_sec
-        self._penalty_ttl_sec = 0  # extra TTL during penalty window
+        self._penalty_ttl_sec = 0  # больше не увеличиваем TTL кэша в штрафе
 
         # NEW: serialize actual HTTP calls too (prevents parallel in-flight requests)
         self._net_lock = asyncio.Lock()
@@ -218,23 +218,19 @@ class CoinGeckoClient:
             await self._session.close()
 
     def _enable_penalty(self, *, retry_after: float):
-        # Increase throttling for a while to reduce 429s.
+        # Понижаем агрессивно, но без раздувания TTL
         now = time.time()
-        # window: at least 120s, plus server hint
-        window = max(120.0, retry_after, 0.0)
+        window = max(90.0, retry_after, 0.0)
         self._penalty_until_ts = max(self._penalty_until_ts, now + window)
 
-        # min interval: grow up to 2.5s
+        # min interval: чуть подрастить, но не выше 1.6s
         self._penalty_min_interval_sec = min(
-            max(self._penalty_min_interval_sec * 1.5, self._min_interval_sec),
-            2.5
+            max(self._penalty_min_interval_sec * 1.3, self._min_interval_sec),
+            1.6
         )
 
-        # cache TTL penalty: grow up to +900s
-        self._penalty_ttl_sec = min(
-            max(int(self._penalty_ttl_sec * 1.5), 120),
-            900
-        )
+        # не трогаем TTL кэша
+        self._penalty_ttl_sec = 0
 
     async def _rate_limit_wait(self):
         # simple global pacing between requests (+ adaptive penalty on 429)
@@ -359,7 +355,7 @@ class CoinGeckoClient:
 
         now = time.time()
         in_penalty = now < self._penalty_until_ts
-        effective_ttl = ttl_sec + (self._penalty_ttl_sec if in_penalty else 0)
+        effective_ttl = ttl_sec  # не увеличиваем TTL в штрафе
 
         uniq = sorted(set(ids))
 
@@ -772,7 +768,7 @@ def compute_asset(row, current_price: Optional[float]) -> AssetComputed:
     qty_override = float(row.get("qty_override") or 0.0)
     if qty_override > 0:
         qty = qty_override
-    elif entry > 0:
+    elif entry > 0 and invested > 0:
         qty = invested / entry
     else:
         qty = 0.0
@@ -792,8 +788,14 @@ def compute_asset(row, current_price: Optional[float]) -> AssetComputed:
         )
 
     current_value = qty * float(current_price)
-    pnl_usd = current_value - invested
-    pnl_pct = None if invested == 0 else (pnl_usd / invested * 100.0)
+
+    # базовая сумма для расчёта PNL:
+    # - если invested > 0: классика (от вложений)
+    # - если invested == 0 и entry > 0: считаем от стоимости по цене входа (qty*entry)
+    base_invested = invested if invested > 0 else (qty * entry if entry > 0 else 0.0)
+
+    pnl_usd = current_value - base_invested
+    pnl_pct = None if base_invested == 0 else (pnl_usd / base_invested * 100.0)
 
     return AssetComputed(
         asset_id=int(row["id"]),
@@ -1147,7 +1149,7 @@ async def on_add_choose_coin(cb: CallbackQuery, state: FSMContext):
         await state.set_state(AddAssetFSM.entry)
         await cb.message.answer(
             "Бесплатная позиция.\n"
-            "Введи цену, по которой досталась монета (USD). Можно 0:"
+            "Введи цену, по которой досталась монета (USD). Нужно > 0, чтобы считать PNL и алерты:"
         )
         await cb.answer()
         return
@@ -1192,21 +1194,22 @@ async def on_add_invested(m: Message, state: FSMContext):
 @router.message(AddAssetFSM.entry)
 async def on_add_entry(m: Message, state: FSMContext):
     v = safe_float(m.text or "")
-    if v is None or v < 0:
-        return await m.answer("Цена входа не может быть отрицательной.")
+    if v is None or v <= 0:
+        return await m.answer("Цена входа должна быть больше 0.")
 
     entry = float(v)
     data = await state.get_data()
     invested = float(data.get("invested", 0.0))
 
+    # для free-позиций (invested=0) цена входа обязана быть >0 — уже проверили выше
     await state.update_data(entry=entry)
 
     # Если сумму/цену нельзя использовать для auto-qty — вводим количество вручную
-    if invested == 0 or entry == 0:
+    if invested == 0:
         await state.set_state(AddAssetFSM.quantity)
         return await m.answer(
             "Введи количество монет (например 123.4567):\n"
-            "Если сумма = 0, то entry будет использоваться как база для алертов."
+            "PNL и алерты будут считаться от этой цены входа."
         )
 
     await state.update_data(selected_alerts=set(), qty_override=None)
@@ -1240,26 +1243,10 @@ async def on_add_quantity(m: Message, state: FSMContext):
     entry = float(data.get("entry", 0.0))
     qty_override = float(qty)
 
-    # Если entry <= 0 — алерты бессмысленны, сохраняем сразу
-    if entry <= 0:
-        await add_asset_row(
-            m.from_user.id,
-            sym,
-            coingecko_id,
-            nm,
-            invested,
-            entry,
-            qty_override=qty_override,
-        )
-        await state.clear()
-        return await m.answer(
-            "Готово ✅ Позиция сохранена.\n"
-            "Алерты по процентам недоступны при цене входа 0.",
-            reply_markup=main_menu_kb()
-        )
-
-    # entry > 0: можно алерты
     await state.update_data(selected_alerts=set())
+
+    note = "" if entry > 0 else "\n⚠️ Цена входа = 0, % алерты и PNL не будут посчитаны."
+
     preview = "\n".join([
         f"Ок, добавляем: {sym} ({nm})",
         f"Сумма: {fmt_usd(invested)}",
@@ -1268,8 +1255,10 @@ async def on_add_quantity(m: Message, state: FSMContext):
         "",
         "Выбери алерты (можно несколько) и нажми «💾 Готово»:"
     ])
+
     await state.set_state(AddAssetFSM.alerts)
-    await m.answer(preview, reply_markup=alerts_kb(set()))
+    await m.answer(preview + note, reply_markup=alerts_kb(set()))
+
 @router.callback_query(AddAssetFSM.alerts, F.data.startswith("add:alert:"))
 async def on_add_alerts(cb: CallbackQuery, state: FSMContext):
     action = cb.data.split("add:alert:", 1)[1]
@@ -1533,6 +1522,7 @@ async def on_pnl_period(m: Message):
 
 # ---------------------------- background loops ----------------------------
 async def alerts_loop(bot: Bot):
+    # rearm_frac не нужен в новой логике, но оставим переменную
     rearm_frac = max(0.0, ALERT_REARM_PCT) / 100.0
 
     while True:
@@ -1551,32 +1541,35 @@ async def alerts_loop(bot: Bot):
                     cur = float(current)
                     t = str(r.get("type") or "")
                     target = float(r["target_price"])
-                    triggered = int(r.get("triggered") or 0)
+                    pct = int(r["pct"])
                     alert_id = int(r["alert_id"])
 
                     hit = (cur <= target) if t == "RISK" else (cur >= target)
 
-                    # 1) Если “попали в зону” и алерт был вооружён — шлём и ставим triggered=1
-                    if hit and triggered == 0:
+                    if hit:
                         invested = float(r["invested_usd"])
                         entry = float(r["entry_price"])
                         qty_override = float(r.get("qty_override") or 0.0)
+
                         if qty_override > 0:
                             qty = qty_override
-                        elif entry > 0:
+                        elif entry > 0 and invested > 0:
                             qty = invested / entry
                         else:
                             qty = 0.0
                         if qty == 0:
+                            # нет количества — нечего считать/слать
                             continue
 
-                        pnl_usd = qty * cur - invested
-                        pnl_pct = None if invested == 0 else (pnl_usd / invested * 100.0)
+                        # PNL считаем:
+                        # если invested>0 — от вложений
+                        # если invested==0 и entry>0 — от базы qty*entry
+                        base_invested = invested if invested > 0 else (qty * entry if entry > 0 else 0.0)
+                        pnl_usd = qty * cur - base_invested
+                        pnl_pct = None if base_invested == 0 else (pnl_usd / base_invested * 100.0)
                         pct_text = "—" if pnl_pct is None else sign_pct(pnl_pct)
 
-                        pct = int(r["pct"])
                         sym = str(r["symbol"] or "")
-
                         move_icon = "🔴" if t == "RISK" else "🟢"
                         move_text = f"Цена снизилась на {pct}%" if t == "RISK" else f"Цена увеличилась на {pct}%"
 
@@ -1588,22 +1581,21 @@ async def alerts_loop(bot: Bot):
                         ])
 
                         await bot.send_message(chat_id=int(r["user_id"]), text=text)
-                        await mark_alert_triggered(alert_id)
-                        continue
 
-                    # 2) Если “вышли из зоны” и алерт был triggered=1 — пере-вооружаем
-                    if (not hit) and triggered == 1:
-                        if rearm_frac <= 0:
-                            await reset_alert_triggered(alert_id)
+                        # Сдвигаем цель дальше на тот же процент от текущей цены (grid)
+                        if t == "RISK":
+                            new_target = cur * (1 - pct / 100.0)
                         else:
-                            if t == "RISK":
-                                # rearm когда цена восстановилась выше target на rearm_pct
-                                if cur >= target * (1.0 + rearm_frac):
-                                    await reset_alert_triggered(alert_id)
-                            else:
-                                # TP: rearm когда цена упала ниже target на rearm_pct
-                                if cur <= target * (1.0 - rearm_frac):
-                                    await reset_alert_triggered(alert_id)
+                            new_target = cur * (1 + pct / 100.0)
+
+                        await db_exec(
+                            "UPDATE alerts SET target_price=$1, triggered=0, triggered_at=NULL WHERE id=$2",
+                            (float(new_target), alert_id)
+                        )
+
+                    else:
+                        # В новой логике triggered не используем: алерт всегда «вооружён»
+                        pass
 
         except Exception as e:
             log.exception("alerts_loop error: %r", e)
