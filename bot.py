@@ -15,7 +15,7 @@ from aiohttp import web
 import asyncpg
 
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery,
     ReplyKeyboardMarkup, KeyboardButton,
@@ -65,6 +65,7 @@ RISK_LEVELS = [5, 10, 25]
 TP_LEVELS = [5, 10, 25]
 ALERT_REARM_PCT = float(os.getenv("ALERT_REARM_PCT", "0.3"))
 # 0.3% = небольшой запас, чтобы алерт не “дребезжал” туда-сюда вокруг target
+VERSION = "1.3.0"
 
 async def run_health_server():
     app = web.Application()
@@ -192,6 +193,10 @@ class CoinGeckoClient:
         self._penalty_until_ts = 0.0
         self._penalty_min_interval_sec = self._min_interval_sec
         self._penalty_ttl_sec = 0  # больше не увеличиваем TTL кэша в штрафе
+        # stats
+        self._stats_calls = 0
+        self._stats_time = 0.0
+        self._stats_429 = 0
 
         # NEW: serialize actual HTTP calls too (prevents parallel in-flight requests)
         self._net_lock = asyncio.Lock()
@@ -260,6 +265,7 @@ class CoinGeckoClient:
 
             for attempt in range(1, tries + 1):
                 try:
+                    t0 = time.perf_counter()
                     s = await self.session()
 
                     await self._rate_limit_wait()
@@ -272,11 +278,22 @@ class CoinGeckoClient:
 
                     if status == 200:
                         try:
-                            return json.loads(text) if text else {}
+                            obj = json.loads(text) if text else {}
                         except Exception as e:
                             raise RuntimeError(f"CoinGecko bad JSON ({path}): {text[:200]}") from e
 
+                        # stats
+                        dur = time.perf_counter() - t0
+                        self._stats_calls += 1
+                        self._stats_time += dur
+                        if self._stats_calls % 50 == 0:
+                            avg = self._stats_time / max(1, self._stats_calls)
+                            log.info("CG avg latency=%.3fs calls=%d 429=%d", avg, self._stats_calls, self._stats_429)
+
+                        return obj
+
                     if status == 429:
+                        self._stats_429 += 1
                         ra = headers.get("Retry-After", "")
                         try:
                             retry_after = float(ra)
@@ -851,6 +868,8 @@ def asset_card(comp: AssetComputed, risk_pcts: List[int], tp_pcts: List[int]) ->
     ])
 
 async def build_summary_text(user_id: int) -> str:
+    ts_text = time.strftime("%H:%M:%S", time.localtime())
+    price_ttl = 180  # TTL кэша цен в simple_prices_usd
     assets, alerts_by_asset = await list_assets_with_alerts(user_id)
     if not assets:
         return (
@@ -901,6 +920,7 @@ async def build_summary_text(user_id: int) -> str:
             if comp.current is None:
                 line_top = f"• <b>{sym}</b> · Стоимость —"
                 line_mid = f"{IND}Δ от входа: —"
+                line_base = f"{IND}База: —"
             else:
                 current_value = comp.qty * float(comp.current)
                 line_top = f"• <b>{sym}</b> · Стоимость {money_usd(current_value)}"
@@ -911,8 +931,10 @@ async def build_summary_text(user_id: int) -> str:
                     delta_pct = None if base_value == 0 else (delta_usd / base_value * 100.0)
                     pct_text = "—" if delta_pct is None else sign_pct(delta_pct)
                     line_mid = f"{IND}Δ от входа: {sign_money(delta_usd)} ({pct_text})"
+                    line_base = f"{IND}База: {money_usd(base_value)}"
                 else:
                     line_mid = f"{IND}Δ от входа: —"
+                    line_base = f"{IND}База: —"
 
         # Обычные позиции: старый формат PNL от вложенной суммы
         else:
@@ -927,9 +949,14 @@ async def build_summary_text(user_id: int) -> str:
         line_qty = f"{IND}Кол-во монет: {qty_text}"
         line_alert = f"{IND}<b>{format_alert_line(risk_pcts, tp_pcts)}</b>"
 
-        blocks.append("\n".join([line_top, line_mid, line_qty, line_alert]))
+        rows_block = [line_top, line_mid]
+        if comp.invested == 0:
+            rows_block.append(line_base)
+        rows_block.extend([line_qty, line_alert])
+
+        blocks.append("\n".join(rows_block))
     footer_lines: List[str] = [
-        f"Токены: {known}/{total_assets}",
+        ("⚠️ Цены: " if known != total_assets else "✅ Цены: ") + f"{known}/{total_assets}",
         f"Вложено: {money_usd(total_invested)}",
     ]
 
@@ -945,7 +972,10 @@ async def build_summary_text(user_id: int) -> str:
             f"<b>{pnl_icon(total_pnl)} ОБЩИЙ PNL: {sign_money(total_pnl)} ({pct_text})</b>"
         )
 
+    footer_lines.append(f"Обновлено: {ts_text}, источник: CoinGecko, TTL: {price_ttl}s")
+
     return "📊 <b>Сводка портфеля</b>\n\n" + "\n\n".join(blocks) + "\n\n" + "\n".join(footer_lines)
+
 # ---------------------------- FSM ----------------------------
 class AddAssetFSM(StatesGroup):
     mode = State()
@@ -961,6 +991,9 @@ class EditAssetFSM(StatesGroup):
     invested = State()
     entry = State()
     quantity = State()
+
+class EditAlertsFSM(StatesGroup):
+    alerts = State()
 
 # ---------------------------- keyboards for flows ----------------------------
 def add_mode_kb() -> InlineKeyboardMarkup:
@@ -1028,6 +1061,10 @@ def assets_edit_list_kb(assets_rows) -> InlineKeyboardMarkup:
                 callback_data=f"edit:asset:{a['id']}"
             ),
             InlineKeyboardButton(
+                text="🔔",
+                callback_data=f"edit:alerts:{a['id']}"
+            ),
+            InlineKeyboardButton(
                 text="🗑",
                 callback_data=f"edit:delete:{a['id']}"
             )
@@ -1054,6 +1091,28 @@ async def on_start(m: Message):
         reply_markup=main_menu_kb()
     )
 
+@router.message(Command("help"))
+async def on_help(m: Message):
+    await m.answer(
+        "Что умею:\n"
+        "• Сводка портфеля, PNL, алерты по уровням.\n"
+        "• Free-позиции: задаёшь цену входа и количество — PNL считается от базы entry*qty.\n"
+        "• Алерты 'решёткой': при достижении уровня цель сдвигается ещё на тот же % от текущей цены.\n\n"
+        "Как работают алерты-решётка:\n"
+        "— Дошли до +10%: пришло уведомление, новая цель = текущая цена * 1.10.\n"
+        "— Дошли до -10%: пришло уведомление, новая цель = текущая цена * 0.90.\n"
+        "Так продолжается дальше по тренду."
+    )
+
+@router.message(Command("about"))
+async def on_about(m: Message):
+    await m.answer(
+        f"Версия бота: {VERSION}\n"
+        "Источник цен: CoinGecko (free tier)\n"
+        "Автор: you\n"
+        "Репо: https://github.com/your/repo"
+    )
+
 @router.message(F.text == "📊 Сводка")
 async def on_summary(m: Message):
     await upsert_user(m.from_user.id)
@@ -1076,6 +1135,7 @@ async def on_summary_refresh(cb: CallbackQuery):
         await cb.message.edit_text(text, reply_markup=summary_kb())
     except TelegramBadRequest as e:
         if "message is not modified" in str(e):
+            await cb.answer("Актуально")
             return
         raise
 
@@ -1147,9 +1207,14 @@ async def on_add_choose_coin(cb: CallbackQuery, state: FSMContext):
     if mode == "free":
         await state.update_data(invested=0.0)
         await state.set_state(AddAssetFSM.entry)
+        kb_info = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="ℹ️ Как считать free-позиции", callback_data="info:free")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="flow:cancel")]
+        ])
         await cb.message.answer(
             "Бесплатная позиция.\n"
-            "Введи цену, по которой досталась монета (USD). Нужно > 0, чтобы считать PNL и алерты:"
+            "Введи цену, по которой досталась монета (USD). Нужно > 0, чтобы считать PNL и алерты:",
+            reply_markup=kb_info
         )
         await cb.answer()
         return
@@ -1180,6 +1245,54 @@ async def on_add_mode(cb: CallbackQuery, state: FSMContext):
         pass
 
     await cb.message.answer("Введи тикер/название монеты (пример: BTC, ETH, SOL):")
+    await cb.answer()
+
+@router.callback_query(F.data == "info:free")
+async def on_info_free(cb: CallbackQuery):
+    await cb.answer()  # закрыть спиннер
+    await cb.message.answer(
+        "Как считать free-позиции:\n"
+        "1) Укажи цену входа (>0) — по ней считаются база и алерты.\n"
+        "2) Укажи количество монет — по нему считается стоимость и PNL.\n"
+        "PNL идёт от базы (entry * qty), даже если вложено = 0."
+    )
+
+@router.callback_query(F.data.startswith("edit:alerts:"))
+async def on_edit_alerts_start(cb: CallbackQuery, state: FSMContext):
+    try:
+        asset_id = int(cb.data.split("edit:alerts:", 1)[1])
+    except Exception:
+        return await cb.answer("Некорректный id")
+
+    a = await get_asset(cb.from_user.id, asset_id)
+    if not a:
+        return await cb.answer("Актив не найден")
+
+    # соберём выбранные алерты
+    rows = await list_alerts_for_asset(asset_id)
+    selected: Set[str] = set()
+    for r in rows:
+        t = str(r["type"])
+        pct = int(r["pct"])
+        selected.add(f"{t}:{pct}")
+
+    await state.clear()
+    await state.update_data(
+        asset_id=asset_id,
+        entry=float(a["entry_price"]),
+        selected_alerts=selected
+    )
+    await state.set_state(EditAlertsFSM.alerts)
+
+    sym = a["symbol"]
+    entry = float(a["entry_price"])
+    msg = "\n".join([
+        f"Редактируем алерты для {sym}",
+        f"Цена входа: {fmt_usd(entry)}",
+        "",
+        "Отметь уровни и нажми «💾 Готово»"
+    ])
+    await cb.message.answer(msg, reply_markup=alerts_kb(selected))
     await cb.answer()
 
 @router.message(AddAssetFSM.invested)
@@ -1314,6 +1427,50 @@ async def on_add_alerts(cb: CallbackQuery, state: FSMContext):
         await cb.message.answer("Готово ✅ Актив добавлен.", reply_markup=main_menu_kb())
         return await cb.answer("Сохранено")
     # toggle
+    allowed = {f"RISK:{p}" for p in RISK_LEVELS} | {f"TP:{p}" for p in TP_LEVELS}
+    if action in allowed:
+        if action in selected:
+            selected.remove(action)
+        else:
+            selected.add(action)
+        await state.update_data(selected_alerts=selected)
+        await cb.message.edit_reply_markup(reply_markup=alerts_kb(selected))
+        return await cb.answer("Ок")
+
+    await cb.answer("Не понял")
+
+@router.callback_query(EditAlertsFSM.alerts, F.data.startswith("add:alert:"))
+async def on_edit_alerts(cb: CallbackQuery, state: FSMContext):
+    action = cb.data.split("add:alert:", 1)[1]
+    data = await state.get_data()
+    selected: Set[str] = set(data.get("selected_alerts", set()))
+    asset_id = int(data.get("asset_id"))
+    entry = float(data.get("entry", 0.0))
+
+    if action == "none":
+        selected = set()
+        await state.update_data(selected_alerts=selected)
+        await cb.message.edit_reply_markup(reply_markup=alerts_kb(selected))
+        return await cb.answer("Без алертов")
+
+    if action == "done":
+        if entry <= 0:
+            await state.clear()
+            await cb.message.answer("Цена входа = 0, алерты не сохранены.", reply_markup=main_menu_kb())
+            return await cb.answer("Нет цены входа")
+
+        alert_rows: List[Tuple[str, int, float]] = []
+        for s in sorted(selected):
+            t, pct_str = s.split(":")
+            pct = int(pct_str)
+            target = entry * (1 - pct / 100.0) if t == "RISK" else entry * (1 + pct / 100.0)
+            alert_rows.append((t, pct, float(target)))
+
+        await replace_alerts(asset_id, alert_rows)
+        await state.clear()
+        await cb.message.answer("Алерты обновлены ✅", reply_markup=main_menu_kb())
+        return await cb.answer("Сохранено")
+
     allowed = {f"RISK:{p}" for p in RISK_LEVELS} | {f"TP:{p}" for p in TP_LEVELS}
     if action in allowed:
         if action in selected:
