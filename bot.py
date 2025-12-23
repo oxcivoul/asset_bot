@@ -25,6 +25,7 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import BufferedInputFile
 
 import json
 import random
@@ -53,6 +54,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 PG_POOL_SIZE = int(os.getenv("PG_POOL_SIZE", "5"))
 
 PRICE_POLL_SECONDS = int(os.getenv("PRICE_POLL_SECONDS", "180"))
+PRICE_TTL_SEC = int(os.getenv("PRICE_TTL_SEC", "180"))
 SNAPSHOT_EVERY_SECONDS = int(os.getenv("SNAPSHOT_EVERY_SECONDS", "14400"))
 
 if not BOT_TOKEN:
@@ -365,14 +367,14 @@ class CoinGeckoClient:
         self._search_cache[q] = (now, out)
         return out
 
-    async def simple_prices_usd(self, ids: List[str], ttl_sec: int = 180) -> Dict[str, float]:
+    async def simple_prices_usd(self, ids: List[str], ttl_sec: Optional[int] = None) -> Dict[str, float]:
         ids = [i for i in ids if i]
         if not ids:
             return {}
 
         now = time.time()
         in_penalty = now < self._penalty_until_ts
-        effective_ttl = ttl_sec  # не увеличиваем TTL в штрафе
+        effective_ttl = PRICE_TTL_SEC if ttl_sec is None else ttl_sec  # не увеличиваем TTL в штрафе
 
         uniq = sorted(set(ids))
 
@@ -473,12 +475,17 @@ async def init_db():
     )
     async with pg_pool.acquire() as conn:
         await conn.execute(SCHEMA_SQL)
-
-        # MIGRATION: для старых БД, где assets уже есть без qty_override
         try:
             await conn.execute("ALTER TABLE assets ADD COLUMN IF NOT EXISTS qty_override DOUBLE PRECISION;")
         except Exception:
             log.exception("Migration failed: ALTER TABLE assets ADD COLUMN qty_override")
+            raise
+
+        # MIGRATION: для старых БД, где assets уже есть без qty_override
+        try:
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS digest_enabled BOOLEAN NOT NULL DEFAULT FALSE;")
+        except Exception:
+            log.exception("Migration failed: ALTER TABLE users ADD COLUMN digest_enabled")
             raise
 
 async def acquire_instance_lock() -> bool:
@@ -570,6 +577,18 @@ async def db_fetchall(sql: str, params: tuple = ()):
             rows = await conn.fetch(sql, *params)
         return [dict(r) for r in rows]
 
+async def delete_all_user_data(user_id: int, delete_snapshots: bool = True):
+    await db_exec("DELETE FROM assets WHERE user_id=$1", (user_id,))
+    if delete_snapshots:
+        await db_exec("DELETE FROM pnl_snapshots WHERE user_id=$1", (user_id,))
+    # users строку не трогаем — пусть остаются настройки/last_summary
+
+def reset_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить всё", callback_data="reset:yes")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="reset:no")],
+    ])
+
 async def upsert_user(user_id: int):
     await db_exec(
         "INSERT INTO users(user_id) VALUES ($1) ON CONFLICT(user_id) DO NOTHING",
@@ -581,6 +600,13 @@ async def set_last_summary_message(user_id: int, chat_id: int, message_id: int):
         "UPDATE users SET last_summary_chat_id=$1, last_summary_message_id=$2 WHERE user_id=$3",
         (chat_id, message_id, user_id)
     )
+
+async def set_digest_enabled(user_id: int, enabled: bool):
+    await db_exec("UPDATE users SET digest_enabled=$1 WHERE user_id=$2", (enabled, user_id))
+
+async def get_digest_enabled(user_id: int) -> bool:
+    row = await db_fetchone("SELECT digest_enabled FROM users WHERE user_id=$1", (user_id,))
+    return bool(row.get("digest_enabled")) if row else False
 
 async def list_assets(user_id: int):
     return await db_fetchall(
@@ -869,7 +895,6 @@ def asset_card(comp: AssetComputed, risk_pcts: List[int], tp_pcts: List[int]) ->
 
 async def build_summary_text(user_id: int) -> str:
     ts_text = time.strftime("%H:%M:%S", time.localtime())
-    price_ttl = 180  # TTL кэша цен в simple_prices_usd
     assets, alerts_by_asset = await list_assets_with_alerts(user_id)
     if not assets:
         return (
@@ -955,6 +980,7 @@ async def build_summary_text(user_id: int) -> str:
         rows_block.extend([line_qty, line_alert])
 
         blocks.append("\n".join(rows_block))
+
     footer_lines: List[str] = [
         ("⚠️ Цены: " if known != total_assets else "✅ Цены: ") + f"{known}/{total_assets}",
         f"Вложено: {money_usd(total_invested)}",
@@ -974,11 +1000,13 @@ async def build_summary_text(user_id: int) -> str:
 
     footer_lines.append("_________________________________________________________")
     footer_lines.extend([
-        "🛠Дополнительно:",
-        f"⌚️Обновлено: {ts_text}",
-        f"⌛️TTL: {price_ttl}s",
-        "📞/about",
-        "❓/help",
+        "🛠FAQ",
+        f"Обновлено: {ts_text}; TTL: {PRICE_TTL_SEC}s",
+        "/about",
+        "/help",
+        "/export",
+        "/digest",
+        "⚠️/reset",
     ])
 
     return "📊 <b>Сводка портфеля</b>\n\n" + "\n\n".join(blocks) + "\n\n" + "\n".join(footer_lines)
@@ -1126,6 +1154,66 @@ async def on_summary(m: Message):
     text = await build_summary_text(m.from_user.id)
     msg = await m.answer(text, reply_markup=summary_kb())
     await set_last_summary_message(m.from_user.id, m.chat.id, msg.message_id)
+
+@router.message(Command("reset"))
+async def on_reset(m: Message):
+    await m.answer(
+        "Вы уверены, что хотите удалить ВСЕ свои активы и снимки PNL? Это действие необратимо.",
+        reply_markup=reset_confirm_kb()
+    )
+
+@router.message(Command("export"))
+async def on_export(m: Message):
+    assets, alerts_by_asset = await list_assets_with_alerts(m.from_user.id)
+    if not assets:
+        return await m.answer("Экспортировать нечего — активов нет.", reply_markup=main_menu_kb())
+
+    lines = ["symbol,name,qty,entry_price,invested_usd,alerts"]
+    for a in assets:
+        invested = float(a["invested_usd"])
+        entry = float(a["entry_price"])
+        qty_override = float(a.get("qty_override") or 0.0)
+        if qty_override > 0:
+            qty = qty_override
+        elif entry > 0 and invested > 0:
+            qty = invested / entry
+        else:
+            qty = 0.0
+
+        alerts = alerts_by_asset.get(a["id"], []) or []
+        risk = sorted({-int(r["pct"]) for r in alerts if r.get("type") == "RISK"})
+        tp = sorted({int(r["pct"]) for r in alerts if r.get("type") == "TP"})
+        alert_parts = [str(p) for p in risk + tp]
+        alert_str = ";".join(alert_parts)
+
+        lines.append(
+            f"{a['symbol']},{(a.get('name') or '').replace(',',' ')},{qty},{entry},{invested},{alert_str}"
+        )
+
+    csv_data = "\n".join(lines).encode("utf-8")
+    buf = BufferedInputFile(csv_data, filename="portfolio.csv")
+    await m.answer_document(buf, caption="Экспорт готов.")
+
+@router.message(Command("digest"))
+async def on_digest(m: Message):
+    await upsert_user(m.from_user.id)
+    current = await get_digest_enabled(m.from_user.id)
+    new_val = not current
+    await set_digest_enabled(m.from_user.id, new_val)
+    status = "включен" if new_val else "выключен"
+    await m.answer(f"Ежедневный дайджест {status}. (Рассылка пока не подключена.)")
+
+@router.callback_query(F.data == "reset:yes")
+async def on_reset_yes(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await delete_all_user_data(cb.from_user.id, delete_snapshots=True)
+    await cb.message.answer("Данные удалены. Начинаем с чистого листа.", reply_markup=main_menu_kb())
+    await cb.answer("Удалено")
+
+@router.callback_query(F.data == "reset:no")
+async def on_reset_no(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.answer("Отменено", show_alert=False)
 
 @router.callback_query(F.data == "summary:refresh")
 async def on_summary_refresh(cb: CallbackQuery):
