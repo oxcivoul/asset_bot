@@ -27,6 +27,12 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import BufferedInputFile
 
+from datetime import datetime, timezone
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # для Python<3.9, если нужно
+
 import json
 import random
 import socket
@@ -481,7 +487,18 @@ async def init_db():
             log.exception("Migration failed: ALTER TABLE assets ADD COLUMN qty_override")
             raise
 
-        # MIGRATION: для старых БД, где assets уже есть без qty_override
+        try:
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_digest_sent_date INTEGER;")
+        except Exception:
+            log.exception("Migration failed: ALTER TABLE users ADD COLUMN last_digest_sent_date")
+            raise
+
+        try:
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS tz TEXT NOT NULL DEFAULT 'UTC';")
+        except Exception:
+            log.exception("Migration failed: ALTER TABLE users ADD COLUMN tz")
+            raise
+
         try:
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS digest_enabled BOOLEAN NOT NULL DEFAULT FALSE;")
         except Exception:
@@ -601,12 +618,36 @@ async def set_last_summary_message(user_id: int, chat_id: int, message_id: int):
         (chat_id, message_id, user_id)
     )
 
+async def get_user_tz_name(user_id: int) -> str:
+    row = await db_fetchone("SELECT tz FROM users WHERE user_id=$1", (user_id,))
+    return (row or {}).get("tz", "UTC")
+
+async def set_user_tz_name(user_id: int, tz_name: str):
+    await db_exec("UPDATE users SET tz=$1 WHERE user_id=$2", (tz_name, user_id))
+
+def resolve_tz(tz_name: str):
+    try:
+        return ZoneInfo(tz_name)
+    except Exception:
+        return timezone.utc
+
 async def set_digest_enabled(user_id: int, enabled: bool):
     await db_exec("UPDATE users SET digest_enabled=$1 WHERE user_id=$2", (enabled, user_id))
 
 async def get_digest_enabled(user_id: int) -> bool:
     row = await db_fetchone("SELECT digest_enabled FROM users WHERE user_id=$1", (user_id,))
     return bool(row.get("digest_enabled")) if row else False
+
+async def get_last_digest_sent_date(user_id: int) -> Optional[int]:
+    row = await db_fetchone("SELECT last_digest_sent_date FROM users WHERE user_id=$1", (user_id,))
+    return row.get("last_digest_sent_date") if row else None
+
+async def set_last_digest_sent_date(user_id: int, yyyymmdd: int):
+    await db_exec("UPDATE users SET last_digest_sent_date=$1 WHERE user_id=$2", (yyyymmdd, user_id))
+
+async def send_digest(bot: Bot, user_id: int):
+    text = await build_summary_text(user_id)
+    await bot.send_message(chat_id=user_id, text=text, reply_markup=summary_kb())
 
 async def list_assets(user_id: int):
     return await db_fetchall(
@@ -894,7 +935,9 @@ def asset_card(comp: AssetComputed, risk_pcts: List[int], tp_pcts: List[int]) ->
     ])
 
 async def build_summary_text(user_id: int) -> str:
-    ts_text = time.strftime("%H:%M:%S", time.localtime())
+    tz_name = await get_user_tz_name(user_id)
+    tz = resolve_tz(tz_name)
+    ts_text = datetime.now(tz).strftime("%H:%M:%S")
     assets, alerts_by_asset = await list_assets_with_alerts(user_id)
     if not assets:
         return (
@@ -1000,13 +1043,13 @@ async def build_summary_text(user_id: int) -> str:
 
     footer_lines.append("_________________________________________________________")
     footer_lines.extend([
-        "🛠FAQ",
+        "<b>🛠 FAQ</b>",
         f"Обновлено: {ts_text}; TTL: {PRICE_TTL_SEC}s",
         "/about",
         "/help",
         "/export",
         "/digest",
-        "⚠️/reset",
+        "/reset",
     ])
 
     return "📊 <b>Сводка портфеля</b>\n\n" + "\n\n".join(blocks) + "\n\n" + "\n".join(footer_lines)
@@ -1194,14 +1237,20 @@ async def on_export(m: Message):
     buf = BufferedInputFile(csv_data, filename="portfolio.csv")
     await m.answer_document(buf, caption="Экспорт готов.")
 
-@router.message(Command("digest"))
-async def on_digest(m: Message):
+@router.message(Command("tz"))
+async def on_tz(m: Message):
     await upsert_user(m.from_user.id)
-    current = await get_digest_enabled(m.from_user.id)
-    new_val = not current
-    await set_digest_enabled(m.from_user.id, new_val)
-    status = "включен" if new_val else "выключен"
-    await m.answer(f"Ежедневный дайджест {status}. (Рассылка пока не подключена.)")
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) == 1:
+        current = await get_user_tz_name(m.from_user.id)
+        return await m.answer(f"Текущий часовой пояс: {current}\nУстановить: /tz Europe/Moscow")
+    tz_name = parts[1].strip()
+    try:
+        ZoneInfo(tz_name)
+    except Exception:
+        return await m.answer("Не понял часовой пояс. Пример: /tz Europe/Moscow")
+    await set_user_tz_name(m.from_user.id, tz_name)
+    await m.answer(f"Часовой пояс обновлён: {tz_name}")
 
 @router.callback_query(F.data == "reset:yes")
 async def on_reset_yes(cb: CallbackQuery, state: FSMContext):
@@ -1213,7 +1262,8 @@ async def on_reset_yes(cb: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "reset:no")
 async def on_reset_no(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    await cb.answer("Отменено", show_alert=False)
+    await cb.message.answer("Отменено. Меню:", reply_markup=main_menu_kb())
+    await cb.answer("Отменено")
 
 @router.callback_query(F.data == "summary:refresh")
 async def on_summary_refresh(cb: CallbackQuery):
@@ -1772,6 +1822,18 @@ async def on_pnl_period(m: Message):
         reply_markup=main_menu_kb()
     )
 
+@router.message(Command("digest"))
+async def on_digest(m: Message):
+    await upsert_user(m.from_user.id)
+    current = await get_digest_enabled(m.from_user.id)
+    new_val = not current
+    await set_digest_enabled(m.from_user.id, new_val)
+    status = "включен" if new_val else "выключен"
+    await m.answer(
+        f"Ежедневный дайджест {status}.\n"
+        "Отправляется в 18:00 UTC. (Если включено.)"
+    )
+
 # ---------------------------- background loops ----------------------------
 async def alerts_loop(bot: Bot):
     # rearm_frac не нужен в новой логике, но оставим переменную
@@ -1896,6 +1958,32 @@ async def snapshots_loop():
 
         await asyncio.sleep(SNAPSHOT_EVERY_SECONDS)
 
+async def digest_loop(bot: Bot):
+    CHECK_INTERVAL_SEC = 300  # каждые 5 минут
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            yyyymmdd = now.year * 10000 + now.month * 100 + now.day
+            is_time = now.hour == 18  # 18:00 UTC час
+            if is_time:
+                users = await all_users()
+                for uid in users:
+                    enabled = await get_digest_enabled(uid)
+                    if not enabled:
+                        continue
+                    last_sent = await get_last_digest_sent_date(uid)
+                    if last_sent == yyyymmdd:
+                        continue  # уже отправляли сегодня
+                    try:
+                        await send_digest(bot, uid)
+                        await set_last_digest_sent_date(uid, yyyymmdd)
+                    except Exception:
+                        log.exception("digest send failed uid=%s", uid)
+        except Exception as e:
+            log.exception("digest_loop error: %r", e)
+
+        await asyncio.sleep(CHECK_INTERVAL_SEC)
+
 # ---------------------------- main ----------------------------
 async def main():
     await init_db()
@@ -1928,15 +2016,14 @@ async def main():
     alert_task = asyncio.create_task(alerts_loop(bot))
     snap_task = asyncio.create_task(snapshots_loop())
 
-    tasks = (health_task, alert_task, snap_task)
+    digest_task = asyncio.create_task(digest_loop(bot))
+    tasks = (health_task, alert_task, snap_task, digest_task)
 
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         for t in tasks:
             t.cancel()
-
-        # "чисто" дождаться отмены тасков, без спама предупреждениями
         await asyncio.gather(*tasks, return_exceptions=True)
 
         await release_instance_lock()
