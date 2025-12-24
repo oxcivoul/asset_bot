@@ -256,6 +256,7 @@ class CoinGeckoClient:
         self._base_min_interval_sec = self._min_interval_sec
         self._penalty_until_ts = 0.0
         self._penalty_min_interval_sec = self._min_interval_sec
+        self._penalty_cap = float(os.getenv("COINGECKO_PENALTY_MAX_INTERVAL_SEC", "5.0"))
         self._penalty_ttl_sec = 0  # больше не увеличиваем TTL кэша в штрафе
         # stats
         self._stats_calls = 0
@@ -294,8 +295,8 @@ class CoinGeckoClient:
 
         # min interval: чуть подрастить, но не выше 1.6s
         self._penalty_min_interval_sec = min(
-            max(self._penalty_min_interval_sec * 1.3, self._min_interval_sec),
-            1.6
+            max(self._penalty_min_interval_sec * 1.3, self._base_min_interval_sec * 1.1),
+            self._penalty_cap
         )
 
         # не трогаем TTL кэша
@@ -734,7 +735,7 @@ async def get_last_digest_sent_date(user_id: int) -> Optional[int]:
 async def set_last_digest_sent_date(user_id: int, yyyymmdd: int):
     await db_exec("UPDATE users SET last_digest_sent_date=$1 WHERE user_id=$2", (yyyymmdd, user_id))
 
-async def get_cached_summary(user_id: int) -> Optional[str]:
+async def get_cached_summary(user_id: int, *, ignore_ttl: bool = False) -> Optional[str]:
     row = await db_fetchone(
         "SELECT last_summary_text, last_summary_cached_at FROM users WHERE user_id=$1",
         (user_id,)
@@ -745,7 +746,7 @@ async def get_cached_summary(user_id: int) -> Optional[str]:
     ts = row.get("last_summary_cached_at")
     if not text or ts is None:
         return None
-    if time.time() - float(ts) > SUMMARY_CACHE_TTL_SEC:
+    if not ignore_ttl and time.time() - float(ts) > SUMMARY_CACHE_TTL_SEC:
         return None
     return text
 
@@ -764,7 +765,7 @@ async def get_summary_text(user_id: int, *, force_refresh: bool = False) -> str:
     try:
         text = await build_summary_text(user_id, force_refresh=force_refresh)
     except CoinGecko429:
-        cached = await get_cached_summary(user_id)
+        cached = await get_cached_summary(user_id, ignore_ttl=True)
         if cached:
             note = "\n\n⚠️ CoinGecko вернул 429, показываю последнюю сохранённую сводку."
             return cached + note
@@ -1110,6 +1111,7 @@ async def build_summary_text(user_id: int, *, force_refresh: bool = False) -> st
 
     known = sum(1 for cid in ids if cid in price_map)
     total_assets = len(ids)
+    missing_symbols = [a["symbol"] for a in assets if a["coingecko_id"] not in price_map]
 
     computed: List[AssetComputed] = []
     total_invested = 0.0
@@ -1182,6 +1184,8 @@ async def build_summary_text(user_id: int, *, force_refresh: bool = False) -> st
     if known != total_assets:
         footer_lines.append("Текущая стоимость: —")
         footer_lines.append("<b>ОБЩИЙ PNL: —</b>")
+        if missing_symbols:
+            footer_lines.append("Нет цен для: " + ", ".join(sorted(missing_symbols)))
     else:
         footer_lines.append(f"Текущая стоимость: {money_usd(total_value)}")
         total_pnl = total_value - total_invested
@@ -1504,8 +1508,9 @@ async def on_summary_refresh(cb: CallbackQuery):
 
     if SUMMARY_REFRESH_LOCK.locked():
         await cb.answer("Уже обновляю — покажу тот же результат.")
-    else:
-        await cb.answer("Обновляю…")
+        return
+
+    await cb.answer("Обновляю…")
 
     t0 = time.perf_counter()
     async with SUMMARY_REFRESH_LOCK:
@@ -1691,7 +1696,7 @@ async def on_edit_alerts_start(cb: CallbackQuery, state: FSMContext):
     await state.update_data(
         asset_id=asset_id,
         entry=float(a["entry_price"]),
-        selected_alerts=selected
+        selected_alerts=sorted(selected)
     )
     await state.set_state(EditAlertsFSM.alerts)
 
@@ -1736,7 +1741,7 @@ async def on_add_entry(m: Message, state: FSMContext):
             "PNL и алерты будут считаться от этой цены входа."
         )
 
-    await state.update_data(selected_alerts=set(), qty_override=None)
+    await state.update_data(selected_alerts=[], qty_override=None)
 
     sym = data.get("symbol", "")
     nm = data.get("name", "")
@@ -1767,7 +1772,7 @@ async def on_add_quantity(m: Message, state: FSMContext):
     entry = float(data.get("entry", 0.0))
     qty_override = float(qty)
 
-    await state.update_data(selected_alerts=set())
+    await state.update_data(selected_alerts=[])
 
     note = "" if entry > 0 else "\n⚠️ Цена входа = 0, % алерты и PNL не будут посчитаны."
 
@@ -1787,11 +1792,11 @@ async def on_add_quantity(m: Message, state: FSMContext):
 async def on_add_alerts(cb: CallbackQuery, state: FSMContext):
     action = cb.data.split("add:alert:", 1)[1]
     data = await state.get_data()
-    selected: Set[str] = set(data.get("selected_alerts", set()))
+    selected: Set[str] = set(data.get("selected_alerts", []))
 
     if action == "none":
         selected = set()
-        await state.update_data(selected_alerts=selected)
+        await state.update_data(selected_alerts=[])
         await cb.message.edit_reply_markup(reply_markup=alerts_kb(selected))
         return await cb.answer("Без алертов")
 
@@ -1844,7 +1849,7 @@ async def on_add_alerts(cb: CallbackQuery, state: FSMContext):
             selected.remove(action)
         else:
             selected.add(action)
-        await state.update_data(selected_alerts=selected)
+        await state.update_data(selected_alerts=sorted(selected))
         await cb.message.edit_reply_markup(reply_markup=alerts_kb(selected))
         return await cb.answer("Ок")
 
@@ -1854,13 +1859,13 @@ async def on_add_alerts(cb: CallbackQuery, state: FSMContext):
 async def on_edit_alerts(cb: CallbackQuery, state: FSMContext):
     action = cb.data.split("add:alert:", 1)[1]
     data = await state.get_data()
-    selected: Set[str] = set(data.get("selected_alerts", set()))
+    selected: Set[str] = set(data.get("selected_alerts", []))
     asset_id = int(data.get("asset_id"))
     entry = float(data.get("entry", 0.0))
 
     if action == "none":
         selected = set()
-        await state.update_data(selected_alerts=selected)
+        await state.update_data(selected_alerts=sorted(selected))
         await cb.message.edit_reply_markup(reply_markup=alerts_kb(selected))
         return await cb.answer("Без алертов")
 
@@ -1888,7 +1893,7 @@ async def on_edit_alerts(cb: CallbackQuery, state: FSMContext):
             selected.remove(action)
         else:
             selected.add(action)
-        await state.update_data(selected_alerts=selected)
+        await state.update_data(selected_alerts=sorted(selected))
         await cb.message.edit_reply_markup(reply_markup=alerts_kb(selected))
         return await cb.answer("Ок")
 
@@ -2195,6 +2200,8 @@ async def alerts_loop():
                     (float(new_target), alert_id)
                 )
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             log.exception("alerts_loop error: %r", e)
 
@@ -2219,22 +2226,25 @@ async def snapshots_loop():
                 incomplete = known != len(ids)
                 if incomplete:
                     log.warning("Partial snapshot uid=%s: prices %d/%d", uid, known, len(ids))
-
                 total_invested = 0.0
                 total_value = 0.0
                 for a in assets:
                     invested = float(a["invested_usd"])
                     entry = float(a["entry_price"])
                     qty_override = float(a.get("qty_override") or 0.0)
+
                     if qty_override > 0:
                         qty = qty_override
-                    elif entry > 0:
+                    elif entry > 0 and invested > 0:
                         qty = invested / entry
                     else:
                         qty = 0.0
+
                     if qty == 0:
                         continue
-                    total_invested += invested
+
+                    base_invested = invested if invested > 0 else (qty * entry if entry > 0 else 0.0)
+                    total_invested += base_invested
 
                     cp = price_map.get(a["coingecko_id"])
                     if cp is not None:
@@ -2246,6 +2256,8 @@ async def snapshots_loop():
                     total_invested=total_invested,
                     incomplete=incomplete
                 )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             log.exception("snapshots_loop error: %r", e)
 
@@ -2253,32 +2265,41 @@ async def snapshots_loop():
 
 async def digest_loop():
     while True:
-        now = datetime.now(timezone.utc)
-        target = now.replace(hour=18, minute=0, second=0, microsecond=0)
-        if now >= target:
-            target += timedelta(days=1)
+        try:
+            now = datetime.now(timezone.utc)
+            target = now.replace(hour=18, minute=0, second=0, microsecond=0)
+            if now >= target:
+                target += timedelta(days=1)
 
-        sleep_for = max(0.0, (target - now).total_seconds())
-        await asyncio.sleep(sleep_for)
+            sleep_for = max(0.0, (target - now).total_seconds())
+            await asyncio.sleep(sleep_for)
 
-        date_key = target.year * 10000 + target.month * 100 + target.day
+            date_key = target.year * 10000 + target.month * 100 + target.day
 
-        while True:
-            try:
-                rows = await list_digest_enabled_users()
-                for row in rows:
-                    user_id = int(row["user_id"])
-                    tz_name = row.get("tz") or "UTC"
-                    last_sent = row.get("last_digest_sent_date")
-                    if last_sent == date_key:
-                        continue
-                    sent = await send_digest(user_id, tz_name=tz_name)
-                    if sent:
-                        await set_last_digest_sent_date(user_id, date_key)
-                break
-            except Exception as e:
-                log.exception("digest_loop error: %r", e)
-                await asyncio.sleep(60)
+            while True:
+                try:
+                    rows = await list_digest_enabled_users()
+                    for row in rows:
+                        user_id = int(row["user_id"])
+                        tz_name = row.get("tz") or "UTC"
+                        last_sent = row.get("last_digest_sent_date")
+                        if last_sent == date_key:
+                            continue
+                        sent = await send_digest(user_id, tz_name=tz_name)
+                        if sent:
+                            await set_last_digest_sent_date(user_id, date_key)
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log.exception("digest_loop error: %r", e)
+                    await asyncio.sleep(60)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("digest_loop outer error")
+            await asyncio.sleep(60)
 
 # ---------------------------- main ----------------------------
 async def main():
