@@ -61,9 +61,9 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 PG_POOL_SIZE = int(os.getenv("PG_POOL_SIZE", "5"))
 
 PRICE_POLL_SECONDS = int(os.getenv("PRICE_POLL_SECONDS", "180"))
-PRICE_TTL_SEC = int(os.getenv("PRICE_TTL_SEC", "300"))  # было 180
+PRICE_TTL_SEC = int(os.getenv("PRICE_TTL_SEC", "180")) 
 SNAPSHOT_EVERY_SECONDS = int(os.getenv("SNAPSHOT_EVERY_SECONDS", "14400"))
-SUMMARY_CACHE_TTL_SEC = int(os.getenv("SUMMARY_CACHE_TTL_SEC", str(PRICE_TTL_SEC)))  # держим кэш дольше
+SUMMARY_CACHE_TTL_SEC = int(os.getenv("SUMMARY_CACHE_TTL_SEC", "120"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN. Put it into your .env (BOT_TOKEN=...)")
@@ -760,16 +760,23 @@ async def get_summary_text(user_id: int, *, force_refresh: bool = False) -> str:
         cached = await get_cached_summary(user_id)
         if cached:
             return cached
+
     try:
         text = await build_summary_text(user_id, force_refresh=force_refresh)
-        await save_summary_cache(user_id, text)
-        return text
-    except CoinGecko429 as e:
+    except CoinGecko429:
         cached = await get_cached_summary(user_id)
         if cached:
             note = "\n\n⚠️ CoinGecko вернул 429, показываю последнюю сохранённую сводку."
             return cached + note
         raise
+
+    # Не кэшируем пустую сводку (нет цен)
+    if "Цены: 0/" in text:
+        text = "⚠️ Не удалось получить цены (0/N). Попробуй обновить чуть позже.\n\n" + text
+        return text
+
+    await save_summary_cache(user_id, text)
+    return text
 
 async def send_digest(user_id: int, tz_name: Optional[str] = None) -> bool:
     text = await build_daily_digest_text(user_id, tz_name=tz_name)
@@ -1218,6 +1225,13 @@ async def build_daily_digest_text(user_id: int, tz_name: Optional[str] = None) -
         price_map, price_ts = await cg.simple_prices_usd(ids, return_timestamp=True)
     except Exception as e:
         log.warning("Daily digest price fetch failed: %r", e)
+        price_map, price_ts = {}, None
+
+    if not price_map:
+        return (
+            f"📬 Ежедневный дайджест за {day_label} ({tz_name})\n"
+            "⚠️ Не удалось получить цены ни по одному активу. Попробуй /summary позже."
+        )
 
     if len(price_map) != len(ids):
         missing = len(ids) - len(price_map)
@@ -1481,10 +1495,12 @@ async def on_summary_refresh(cb: CallbackQuery):
 
     remain = await summary_cooldown_seconds(cb.from_user.id)
     if remain > 0:
-        await cb.answer(
-            f"Новые цены будут через {remain}s — CoinGecko даёт их не чаще, чем раз в {math.ceil(SUMMARY_CACHE_TTL_SEC/60)} мин."
-        )
-        return
+        cached = await get_cached_summary(cb.from_user.id)
+        if not (cached and "Цены: 0/" in cached):
+            await cb.answer(
+                f"Новые цены будут через {remain}s — CoinGecko даёт их не чаще, чем раз в {math.ceil(SUMMARY_CACHE_TTL_SEC/60)} мин."
+            )
+            return
 
     if SUMMARY_REFRESH_LOCK.locked():
         await cb.answer("Уже обновляю — покажу тот же результат.")
