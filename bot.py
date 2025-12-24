@@ -1168,7 +1168,7 @@ async def build_summary_text(user_id: int, *, force_refresh: bool = False) -> st
         "<b>🛠 FAQ</b>",
         f"🕒 Цены CoinGecko: {price_time_text} ({tz_name})",
         f"♻️ TTL кэша: {PRICE_TTL_SEC}s • ручное обновление ≤ 1/3 мин",
-        "/about • /help • /export • /digest • /reset • /settings",
+        "•/about • /help • /export • /digest • /reset • /settings",
     ])
 
     return "📊 <b>Сводка портфеля</b>\n\n" + "\n\n".join(blocks) + "\n\n" + "\n".join(footer_lines)
