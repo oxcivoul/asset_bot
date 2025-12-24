@@ -5,7 +5,7 @@ import math
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Tuple, Set
+from typing import Optional, Dict, List, Tuple, Set, Any
 from html import escape
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -24,14 +24,15 @@ from aiogram.types import (
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import BufferedInputFile
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
     from backports.zoneinfo import ZoneInfo  # для Python<3.9, если нужно
+
 
 import json
 import random
@@ -62,6 +63,7 @@ PG_POOL_SIZE = int(os.getenv("PG_POOL_SIZE", "5"))
 PRICE_POLL_SECONDS = int(os.getenv("PRICE_POLL_SECONDS", "180"))
 PRICE_TTL_SEC = int(os.getenv("PRICE_TTL_SEC", "180"))
 SNAPSHOT_EVERY_SECONDS = int(os.getenv("SNAPSHOT_EVERY_SECONDS", "14400"))
+SUMMARY_CACHE_TTL_SEC = int(os.getenv("SUMMARY_CACHE_TTL_SEC", str(PRICE_TTL_SEC)))
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN. Put it into your .env (BOT_TOKEN=...)")
@@ -95,6 +97,41 @@ async def run_health_server():
     while True:
         await asyncio.sleep(3600)
 
+@dataclass
+class SendTask:
+    chat_id: int
+    text: str
+    kwargs: Dict[str, Any]
+
+send_queue: asyncio.Queue[SendTask] = asyncio.Queue()
+
+async def queue_text_message(chat_id: int, text: str, **kwargs):
+    await send_queue.put(SendTask(chat_id=chat_id, text=text, kwargs=kwargs))
+
+async def send_queue_worker(bot: Bot):
+    while True:
+        task = await send_queue.get()
+        retries = 0
+        while True:
+            try:
+                await bot.send_message(chat_id=task.chat_id, text=task.text, **task.kwargs)
+                break
+            except TelegramRetryAfter as e:
+                delay = float(e.retry_after) + random.uniform(0.05, 0.3)
+                log.warning("RetryAfter %.2fs for chat_id=%s", delay, task.chat_id)
+                await asyncio.sleep(delay)
+            except TelegramBadRequest as e:
+                log.warning("Drop message to chat_id=%s: %s", task.chat_id, e)
+                break
+            except Exception as e:
+                retries += 1
+                delay = min(30.0, 2 ** retries)
+                log.warning("Send failed (attempt=%s) chat_id=%s err=%r", retries, task.chat_id, e)
+                await asyncio.sleep(delay)
+                if retries >= 5:
+                    break
+        send_queue.task_done()
+
 # ---------------------------- UI helpers ----------------------------
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -108,10 +145,15 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
 
 def summary_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data="summary:refresh")],
+        [
+            InlineKeyboardButton(text="🔄 Обновить", callback_data="summary:refresh"),
+            InlineKeyboardButton(text="ℹ️ Почему не обновляется", callback_data="summary:info")
+        ],
         [InlineKeyboardButton(text="➕ Добавить", callback_data="nav:add")],
-        [InlineKeyboardButton(text="✏️ Редактировать", callback_data="nav:edit"),
-         InlineKeyboardButton(text="🗑 Удалить", callback_data="nav:delete")]
+        [
+            InlineKeyboardButton(text="✏️ Редактировать", callback_data="nav:edit"),
+            InlineKeyboardButton(text="🗑 Удалить", callback_data="nav:delete")
+        ]
     ])
 
 def fmt_usd(x: float) -> str:
@@ -373,43 +415,50 @@ class CoinGeckoClient:
         self._search_cache[q] = (now, out)
         return out
 
-    async def simple_prices_usd(self, ids: List[str], ttl_sec: Optional[int] = None) -> Dict[str, float]:
+    async def simple_prices_usd(
+        self,
+        ids: List[str],
+        ttl_sec: Optional[int] = None,
+        return_timestamp: bool = False
+    ):
         ids = [i for i in ids if i]
         if not ids:
-            return {}
+            return ({}, None) if return_timestamp else {}
 
         now = time.time()
-        in_penalty = now < self._penalty_until_ts
-        effective_ttl = PRICE_TTL_SEC if ttl_sec is None else ttl_sec  # не увеличиваем TTL в штрафе
-
+        effective_ttl = PRICE_TTL_SEC if ttl_sec is None else ttl_sec
         uniq = sorted(set(ids))
 
-        # take fresh from per-id cache
         fresh: Dict[str, float] = {}
         stale: List[str] = []
+        data_timestamp: Optional[float] = None
+
         for cid in uniq:
             rec = self._price_cache_id.get(cid)
             if rec and now - rec[0] <= effective_ttl:
                 fresh[cid] = rec[1]
+                data_timestamp = rec[0] if data_timestamp is None else min(data_timestamp, rec[0])
             else:
                 stale.append(cid)
 
         out: Dict[str, float] = dict(fresh)
-        if not stale:
-            return out
+        if stale:
+            CHUNK = 100
+            for i in range(0, len(stale), CHUNK):
+                chunk = stale[i:i + CHUNK]
+                data = await self._get_json("/simple/price", {"ids": ",".join(chunk), "vs_currencies": "usd"})
+                fetch_ts = time.time()
+                for cid, row in (data or {}).items():
+                    try:
+                        price = float(row["usd"])
+                    except Exception:
+                        continue
+                    out[cid] = price
+                    self._price_cache_id[cid] = (fetch_ts, price)
+                    data_timestamp = fetch_ts if data_timestamp is None else min(data_timestamp, fetch_ts)
 
-        CHUNK = 100
-        for i in range(0, len(stale), CHUNK):
-            chunk = stale[i:i + CHUNK]
-            data = await self._get_json("/simple/price", {"ids": ",".join(chunk), "vs_currencies": "usd"})
-            for cid, row in (data or {}).items():
-                try:
-                    price = float(row["usd"])
-                except Exception:
-                    continue
-                out[cid] = price
-                self._price_cache_id[cid] = (now, price)
-
+        if return_timestamp:
+            return out, data_timestamp
         return out
 
 cg = CoinGeckoClient()
@@ -424,7 +473,12 @@ CREATE TABLE IF NOT EXISTS users (
   user_id BIGINT PRIMARY KEY,
   currency TEXT NOT NULL DEFAULT 'USD',
   last_summary_chat_id BIGINT,
-  last_summary_message_id BIGINT
+  last_summary_message_id BIGINT,
+  last_digest_sent_date INTEGER,
+  tz TEXT NOT NULL DEFAULT 'UTC',
+  digest_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  last_summary_text TEXT,
+  last_summary_cached_at BIGINT
 );
 
 CREATE TABLE IF NOT EXISTS assets (
@@ -461,7 +515,8 @@ CREATE TABLE IF NOT EXISTS pnl_snapshots (
   ts BIGINT NOT NULL,
   total_value_usd DOUBLE PRECISION NOT NULL,
   total_invested_usd DOUBLE PRECISION NOT NULL,
-  total_pnl_usd DOUBLE PRECISION NOT NULL
+  total_pnl_usd DOUBLE PRECISION NOT NULL,
+  incomplete BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE INDEX IF NOT EXISTS idx_snap_user_ts ON pnl_snapshots(user_id, ts);
@@ -503,6 +558,26 @@ async def init_db():
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS digest_enabled BOOLEAN NOT NULL DEFAULT FALSE;")
         except Exception:
             log.exception("Migration failed: ALTER TABLE users ADD COLUMN digest_enabled")
+            raise
+
+        try:
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_summary_text TEXT;")
+        except Exception:
+            log.exception("Migration failed: ALTER TABLE users ADD COLUMN last_summary_text")
+            raise
+
+        try:
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_summary_cached_at BIGINT;")
+        except Exception:
+            log.exception("Migration failed: ALTER TABLE users ADD COLUMN last_summary_cached_at")
+            raise
+
+        try:
+            await conn.execute(
+                "ALTER TABLE pnl_snapshots ADD COLUMN IF NOT EXISTS incomplete BOOLEAN NOT NULL DEFAULT FALSE;"
+            )
+        except Exception:
+            log.exception("Migration failed: ALTER TABLE pnl_snapshots ADD COLUMN incomplete")
             raise
 
 async def acquire_instance_lock() -> bool:
@@ -645,9 +720,42 @@ async def get_last_digest_sent_date(user_id: int) -> Optional[int]:
 async def set_last_digest_sent_date(user_id: int, yyyymmdd: int):
     await db_exec("UPDATE users SET last_digest_sent_date=$1 WHERE user_id=$2", (yyyymmdd, user_id))
 
-async def send_digest(bot: Bot, user_id: int):
-    text = await build_summary_text(user_id)
-    await bot.send_message(chat_id=user_id, text=text, reply_markup=summary_kb())
+async def get_cached_summary(user_id: int) -> Optional[str]:
+    row = await db_fetchone(
+        "SELECT last_summary_text, last_summary_cached_at FROM users WHERE user_id=$1",
+        (user_id,)
+    )
+    if not row:
+        return None
+    text = row.get("last_summary_text")
+    ts = row.get("last_summary_cached_at")
+    if not text or ts is None:
+        return None
+    if time.time() - float(ts) > SUMMARY_CACHE_TTL_SEC:
+        return None
+    return text
+
+async def save_summary_cache(user_id: int, text: str):
+    await db_exec(
+        "UPDATE users SET last_summary_text=$1, last_summary_cached_at=$2 WHERE user_id=$3",
+        (text, int(time.time()), user_id)
+    )
+
+async def get_summary_text(user_id: int, *, force_refresh: bool = False) -> str:
+    if not force_refresh:
+        cached = await get_cached_summary(user_id)
+        if cached:
+            return cached
+    text = await build_summary_text(user_id, force_refresh=force_refresh)
+    await save_summary_cache(user_id, text)
+    return text
+
+async def send_digest(user_id: int, tz_name: Optional[str] = None) -> bool:
+    text = await build_daily_digest_text(user_id, tz_name=tz_name)
+    if not text:
+        return False
+    await queue_text_message(user_id, text)
+    return True
 
 async def list_assets(user_id: int):
     return await db_fetchall(
@@ -810,25 +918,36 @@ async def all_users() -> List[int]:
     rows = await db_fetchall("SELECT user_id FROM users")
     return [int(r["user_id"]) for r in rows]
 
-async def insert_snapshot(user_id: int, total_value: float, total_invested: float):
+async def list_digest_enabled_users():
+    return await db_fetchall(
+        "SELECT user_id, tz, last_digest_sent_date FROM users WHERE digest_enabled"
+    )
+
+async def insert_snapshot(user_id: int, total_value: float, total_invested: float, *, incomplete: bool):
     pnl = total_value - total_invested
     await db_exec(
         """
-        INSERT INTO pnl_snapshots(user_id, ts, total_value_usd, total_invested_usd, total_pnl_usd)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO pnl_snapshots(user_id, ts, total_value_usd, total_invested_usd, total_pnl_usd, incomplete)
+        VALUES ($1, $2, $3, $4, $5, $6)
         """,
-        (user_id, int(time.time()), total_value, total_invested, pnl)
+        (user_id, int(time.time()), total_value, total_invested, pnl, incomplete)
     )
 
 async def get_snapshot_latest(user_id: int):
     return await db_fetchone(
-        "SELECT * FROM pnl_snapshots WHERE user_id=$1 ORDER BY ts DESC LIMIT 1",
+        "SELECT * FROM pnl_snapshots WHERE user_id=$1 AND NOT incomplete ORDER BY ts DESC LIMIT 1",
         (user_id,)
     )
 
 async def get_snapshot_at_or_before(user_id: int, ts_cutoff: int):
     return await db_fetchone(
-        "SELECT * FROM pnl_snapshots WHERE user_id=$1 AND ts <= $2 ORDER BY ts DESC LIMIT 1",
+        "SELECT * FROM pnl_snapshots WHERE user_id=$1 AND ts <= $2 AND NOT incomplete ORDER BY ts DESC LIMIT 1",
+        (user_id, ts_cutoff)
+    )
+
+async def get_snapshot_at_or_after(user_id: int, ts_cutoff: int):
+    return await db_fetchone(
+        "SELECT * FROM pnl_snapshots WHERE user_id=$1 AND ts >= $2 AND NOT incomplete ORDER BY ts ASC LIMIT 1",
         (user_id, ts_cutoff)
     )
 
@@ -934,10 +1053,9 @@ def asset_card(comp: AssetComputed, risk_pcts: List[int], tp_pcts: List[int]) ->
         pnl_line
     ])
 
-async def build_summary_text(user_id: int) -> str:
+async def build_summary_text(user_id: int, *, force_refresh: bool = False) -> str:
     tz_name = await get_user_tz_name(user_id)
     tz = resolve_tz(tz_name)
-    ts_text = datetime.now(tz).strftime("%H:%M:%S")
     assets, alerts_by_asset = await list_assets_with_alerts(user_id)
     if not assets:
         return (
@@ -946,13 +1064,21 @@ async def build_summary_text(user_id: int) -> str:
             "Нажми «➕ Добавить актив» и заведём первый."
         )
 
-    ids = list({a["coingecko_id"] for a in assets})
+    ids = sorted({a["coingecko_id"] for a in assets})
 
     price_map: Dict[str, float] = {}
+    price_ts: Optional[float] = None
     try:
-        price_map = await cg.simple_prices_usd(ids)
+        price_map, price_ts = await cg.simple_prices_usd(
+            ids,
+            ttl_sec=0 if force_refresh else PRICE_TTL_SEC,
+            return_timestamp=True
+        )
     except Exception as e:
         log.warning("Price fetch failed: %r", e)
+
+    price_dt = datetime.fromtimestamp(price_ts, tz) if price_ts else datetime.now(tz)
+    price_time_text = price_dt.strftime("%H:%M:%S")
 
     known = sum(1 for cid in ids if cid in price_map)
     total_assets = len(ids)
@@ -980,15 +1106,13 @@ async def build_summary_text(user_id: int) -> str:
 
         sym = escape(comp.symbol)
         qty_text = fmt_qty(comp.qty)
+        indent = "\u00A0\u00A0"
 
-        IND = "\u00A0\u00A0"  # 2 неразрывных пробела для красивого отступа
-
-        # FREE позиции (invested=0): показываем стоимость и Δ от entry (цены получения)
         if comp.invested == 0:
             if comp.current is None:
                 line_top = f"• <b>{sym}</b> · Стоимость —"
-                line_mid = f"{IND}Δ от входа: —"
-                line_base = f"{IND}База: —"
+                line_mid = f"{indent}Δ от входа: —"
+                line_base = f"{indent}База: —"
             else:
                 current_value = comp.qty * float(comp.current)
                 line_top = f"• <b>{sym}</b> · Стоимость {money_usd(current_value)}"
@@ -998,13 +1122,11 @@ async def build_summary_text(user_id: int) -> str:
                     delta_usd = current_value - base_value
                     delta_pct = None if base_value == 0 else (delta_usd / base_value * 100.0)
                     pct_text = "—" if delta_pct is None else sign_pct(delta_pct)
-                    line_mid = f"{IND}Δ от входа: {sign_money(delta_usd)} ({pct_text})"
-                    line_base = f"{IND}База: {money_usd(base_value)}"
+                    line_mid = f"{indent}Δ от входа: {sign_money(delta_usd)} ({pct_text})"
+                    line_base = f"{indent}База: {money_usd(base_value)}"
                 else:
-                    line_mid = f"{IND}Δ от входа: —"
-                    line_base = f"{IND}База: —"
-
-        # Обычные позиции: старый формат PNL от вложенной суммы
+                    line_mid = f"{indent}Δ от входа: —"
+                    line_base = f"{indent}База: —"
         else:
             if comp.current is None or comp.pnl_usd is None:
                 line_top = f"• <b>{sym}</b> · PNL —"
@@ -1012,10 +1134,10 @@ async def build_summary_text(user_id: int) -> str:
                 icon = pnl_icon(comp.pnl_usd)
                 pct_text = "—" if comp.pnl_pct is None else sign_pct(comp.pnl_pct)
                 line_top = f"• <b>{sym}</b> · {icon} {sign_money(comp.pnl_usd)} ({pct_text})"
-            line_mid = f"{IND}Вложено: {money_usd(comp.invested)}"
+            line_mid = f"{indent}Вложено: {money_usd(comp.invested)}"
 
-        line_qty = f"{IND}Кол-во монет: {qty_text}"
-        line_alert = f"{IND}<b>{format_alert_line(risk_pcts, tp_pcts)}</b>"
+        line_qty = f"{indent}Кол-во монет: {qty_text}"
+        line_alert = f"{indent}<b>{format_alert_line(risk_pcts, tp_pcts)}</b>"
 
         rows_block = [line_top, line_mid]
         if comp.invested == 0:
@@ -1044,15 +1166,82 @@ async def build_summary_text(user_id: int) -> str:
     footer_lines.append("_________________________________________________________")
     footer_lines.extend([
         "<b>🛠 FAQ</b>",
-        f"Обновлено: {ts_text}; TTL: {PRICE_TTL_SEC}s",
-        "/about",
-        "/help",
-        "/export",
-        "/digest",
-        "/reset",
+        f"🕒 Цены CoinGecko: {price_time_text} ({tz_name})",
+        f"♻️ TTL кэша: {PRICE_TTL_SEC}s • ручное обновление ≤ 1/3 мин",
+        "/about • /help • /export • /digest • /reset • /settings",
     ])
 
     return "📊 <b>Сводка портфеля</b>\n\n" + "\n\n".join(blocks) + "\n\n" + "\n".join(footer_lines)
+
+async def build_daily_digest_text(user_id: int, tz_name: Optional[str] = None) -> Optional[str]:
+    if tz_name is None:
+        tz_name = await get_user_tz_name(user_id)
+    tz = resolve_tz(tz_name)
+
+    now_local = datetime.now(tz)
+    day_label = now_local.strftime("%d.%m.%Y")
+    day_start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_start_ts = int(day_start_local.astimezone(timezone.utc).timestamp())
+
+    assets = await list_assets(user_id)
+    if not assets:
+        return (
+            f"📬 Ежедневный дайджест за {day_label} ({tz_name})\n"
+            "Портфель пуст. Добавь актив через меню, чтобы увидеть дневную динамику."
+        )
+
+    ids = sorted({a["coingecko_id"] for a in assets})
+    price_map: Dict[str, float] = {}
+    price_ts: Optional[float] = None
+    try:
+        price_map, price_ts = await cg.simple_prices_usd(ids, return_timestamp=True)
+    except Exception as e:
+        log.warning("Daily digest price fetch failed: %r", e)
+
+    if len(price_map) != len(ids):
+        missing = len(ids) - len(price_map)
+        return (
+            f"📬 Ежедневный дайджест за {day_label} ({tz_name})\n"
+            f"Не удалось посчитать дневной итог: нет цен для {missing} из {len(ids)} активов. Попробуй /summary чуть позже."
+        )
+
+    computed: List[AssetComputed] = []
+    total_invested = 0.0
+    total_value = 0.0
+
+    for asset in assets:
+        comp = compute_asset(asset, price_map.get(asset["coingecko_id"]))
+        computed.append(comp)
+        total_invested += comp.invested
+        if comp.current is not None:
+            total_value += comp.qty * comp.current
+
+    total_pnl = total_value - total_invested
+    total_pct = None if total_invested == 0 else (total_pnl / total_invested * 100.0)
+
+    baseline = await get_snapshot_at_or_after(user_id, day_start_ts)
+    daily_pnl: Optional[float] = None
+    if baseline:
+        daily_pnl = total_pnl - float(baseline["total_pnl_usd"])
+
+    price_dt = datetime.fromtimestamp(price_ts, tz) if price_ts else now_local
+    price_time_text = price_dt.strftime("%H:%M:%S")
+
+    daily_line = "Сегодняшний PNL: — (нет снимка после полуночи)"
+    if daily_pnl is not None:
+        daily_line = f"Сегодняшний PNL: {pnl_icon(daily_pnl)} {sign_money(daily_pnl)}"
+
+    pct_text = "—" if total_pct is None else sign_pct(total_pct)
+
+    lines = [
+        f"📬 Ежедневный дайджест за {day_label} ({tz_name})",
+        daily_line,
+        f"Общий PNL: {pnl_icon(total_pnl)} {sign_money(total_pnl)} ({pct_text})",
+        f"Портфель: {money_usd(total_value)} • Вложено: {money_usd(total_invested)}",
+        f"Цены CoinGecko: {price_time_text} ({tz_name})",
+        "Нужны детали? Введи /summary.",
+    ]
+    return "\n".join(lines)
 
 # ---------------------------- FSM ----------------------------
 class AddAssetFSM(StatesGroup):
@@ -1194,7 +1383,7 @@ async def on_about(m: Message):
 @router.message(F.text == "📊 Сводка")
 async def on_summary(m: Message):
     await upsert_user(m.from_user.id)
-    text = await build_summary_text(m.from_user.id)
+    text = await get_summary_text(m.from_user.id)
     msg = await m.answer(text, reply_markup=summary_kb())
     await set_last_summary_message(m.from_user.id, m.chat.id, msg.message_id)
 
@@ -1270,10 +1459,10 @@ async def on_summary_refresh(cb: CallbackQuery):
     await upsert_user(cb.from_user.id)
 
     # один ответ на callback — сразу закрываем “спиннер” (важно для телефона)
-    await cb.answer("Обновляю...")
+    await cb.answer("Обновляю (цены CoinGecko не чаще 1 раза в 3 минуты)")
 
     t0 = time.perf_counter()
-    text = await build_summary_text(cb.from_user.id)
+    text = await get_summary_text(cb.from_user.id, force_refresh=True)
     log.info("summary_refresh uid=%s took %.3fs", cb.from_user.id, time.perf_counter() - t0)
 
     try:
@@ -1297,6 +1486,35 @@ async def on_nav_add(cb: CallbackQuery, state: FSMContext):
     await state.set_state(AddAssetFSM.mode)
     await cb.message.answer("Выбери тип позиции:", reply_markup=add_mode_kb())
     await cb.answer()
+
+@router.callback_query(F.data == "summary:info")
+async def on_summary_info(cb: CallbackQuery):
+    await upsert_user(cb.from_user.id)
+    tz_name = await get_user_tz_name(cb.from_user.id)
+    tz = resolve_tz(tz_name)
+    row = await db_fetchone(
+        "SELECT last_summary_cached_at FROM users WHERE user_id=$1",
+        (cb.from_user.id,)
+    )
+    last_ts = (row or {}).get("last_summary_cached_at")
+    if last_ts:
+        last_dt = datetime.fromtimestamp(float(last_ts), tz)
+        age = int(time.time() - float(last_ts))
+        last_line = (
+            f"Последнее обновление: {last_dt.strftime('%H:%M:%S')} ({tz_name}), {age}s назад."
+        )
+    else:
+        last_line = "Сводка ещё ни разу не обновлялась."
+
+    text = "\n".join([
+        "ℹ️ <b>Почему сводка не обновляется мгновенно?</b>",
+        f"CoinGecko даёт новые цены не чаще, чем раз в {SUMMARY_CACHE_TTL_SEC} секунд.",
+        "Если ты жмёшь «Обновить» раньше — бот показывает кэш и не трогает лимит.",
+        last_line,
+        "Как только таймер истечёт, кнопка даст свежие цены."
+    ])
+    await cb.message.answer(text)
+    await cb.answer("Готово")
 
 @router.message(F.text == "➕ Добавить актив")
 async def on_add_asset_start(m: Message, state: FSMContext):
@@ -1628,6 +1846,37 @@ async def on_edit_alerts(cb: CallbackQuery, state: FSMContext):
 
     await cb.answer("Не понял")
 
+@router.message(Command("settings"))
+async def on_settings(m: Message):
+    await upsert_user(m.from_user.id)
+    tz_name = await get_user_tz_name(m.from_user.id)
+    digest_on = await get_digest_enabled(m.from_user.id)
+    assets = await list_assets(m.from_user.id)
+    row = await db_fetchone(
+        "SELECT last_summary_cached_at FROM users WHERE user_id=$1",
+        (m.from_user.id,)
+    )
+    cache_ts = (row or {}).get("last_summary_cached_at")
+    if cache_ts:
+        age = max(0, SUMMARY_CACHE_TTL_SEC - int(time.time() - cache_ts))
+        cache_line = f"Кэш сводки: активен, обновится через {age}s"
+    else:
+        cache_line = "Кэш сводки: нет (будет после /summary)"
+
+    text = "\n".join([
+        "⚙️ <b>Настройки</b>",
+        f"Часовой пояс: {tz_name}",
+        f"Ежедневный дайджест: {'включён' if digest_on else 'выключен'} (18:00 UTC)",
+        f"Активов в портфеле: {len(assets)}",
+        cache_line,
+        "",
+        "Команды:",
+        "/tz <Region/City> — изменить часовой пояс",
+        "/digest — вкл/выкл дайджест",
+        "/reset — сбросить данные"
+    ])
+    await m.answer(text, reply_markup=main_menu_kb())
+
 # ------- delete -------
 @router.message(F.text == "🗑 Удалить актив")
 async def on_delete_menu(m: Message):
@@ -1835,81 +2084,68 @@ async def on_digest(m: Message):
     )
 
 # ---------------------------- background loops ----------------------------
-async def alerts_loop(bot: Bot):
-    # rearm_frac не нужен в новой логике, но оставим переменную
-    rearm_frac = max(0.0, ALERT_REARM_PCT) / 100.0
-
+async def alerts_loop():
     while True:
         try:
             rows = await pending_alerts_joined()
-            if rows:
-                ids = list({r["coingecko_id"] for r in rows if r.get("coingecko_id")})
-                price_map = await cg.simple_prices_usd(ids)
+            if not rows:
+                await asyncio.sleep(PRICE_POLL_SECONDS)
+                continue
 
-                for r in rows:
-                    cid = r.get("coingecko_id")
-                    current = price_map.get(cid)
-                    if current is None:
-                        continue
+            ids = list({r["coingecko_id"] for r in rows if r.get("coingecko_id")})
+            price_map = await cg.simple_prices_usd(ids)
 
-                    cur = float(current)
-                    t = str(r.get("type") or "")
-                    target = float(r["target_price"])
-                    pct = int(r["pct"])
-                    alert_id = int(r["alert_id"])
+            for r in rows:
+                cid = r.get("coingecko_id")
+                current = price_map.get(cid)
+                if current is None:
+                    continue
 
-                    hit = (cur <= target) if t == "RISK" else (cur >= target)
+                cur = float(current)
+                t = str(r.get("type") or "")
+                target = float(r["target_price"])
+                pct = int(r["pct"])
+                alert_id = int(r["alert_id"])
 
-                    if hit:
-                        invested = float(r["invested_usd"])
-                        entry = float(r["entry_price"])
-                        qty_override = float(r.get("qty_override") or 0.0)
+                hit = (cur <= target) if t == "RISK" else (cur >= target)
+                if not hit:
+                    continue
 
-                        if qty_override > 0:
-                            qty = qty_override
-                        elif entry > 0 and invested > 0:
-                            qty = invested / entry
-                        else:
-                            qty = 0.0
-                        if qty == 0:
-                            # нет количества — нечего считать/слать
-                            continue
+                invested = float(r["invested_usd"])
+                entry = float(r["entry_price"])
+                qty_override = float(r.get("qty_override") or 0.0)
 
-                        # PNL считаем:
-                        # если invested>0 — от вложений
-                        # если invested==0 и entry>0 — от базы qty*entry
-                        base_invested = invested if invested > 0 else (qty * entry if entry > 0 else 0.0)
-                        pnl_usd = qty * cur - base_invested
-                        pnl_pct = None if base_invested == 0 else (pnl_usd / base_invested * 100.0)
-                        pct_text = "—" if pnl_pct is None else sign_pct(pnl_pct)
+                if qty_override > 0:
+                    qty = qty_override
+                elif entry > 0 and invested > 0:
+                    qty = invested / entry
+                else:
+                    qty = 0.0
+                if qty == 0:
+                    continue
 
-                        sym = str(r["symbol"] or "")
-                        move_icon = "🔴" if t == "RISK" else "🟢"
-                        move_text = f"Цена снизилась на {pct}%" if t == "RISK" else f"Цена увеличилась на {pct}%"
+                base_invested = invested if invested > 0 else (qty * entry if entry > 0 else 0.0)
+                pnl_usd = qty * cur - base_invested
+                pnl_pct = None if base_invested == 0 else (pnl_usd / base_invested * 100.0)
+                pct_text = "—" if pnl_pct is None else sign_pct(pnl_pct)
 
-                        text = "\n".join([
-                            f"<b>🔔 АЛЕРТ: {escape(sym)}</b>",
-                            f"{move_icon} {move_text}",
-                            f"Текущая цена: {fmt_price(cur)}",
-                            f"{pnl_icon(pnl_usd)} PNL сейчас: {sign_money(pnl_usd)} ({pct_text})",
-                        ])
+                sym = str(r["symbol"] or "")
+                move_icon = "🔴" if t == "RISK" else "🟢"
+                move_text = f"Цена снизилась на {pct}%" if t == "RISK" else f"Цена увеличилась на {pct}%"
 
-                        await bot.send_message(chat_id=int(r["user_id"]), text=text)
+                text = "\n".join([
+                    f"<b>🔔 АЛЕРТ: {escape(sym)}</b>",
+                    f"{move_icon} {move_text}",
+                    f"Текущая цена: {fmt_price(cur)}",
+                    f"{pnl_icon(pnl_usd)} PNL сейчас: {sign_money(pnl_usd)} ({pct_text})",
+                ])
+                await queue_text_message(int(r["user_id"]), text)
 
-                        # Сдвигаем цель дальше на тот же процент от текущей цены (grid)
-                        if t == "RISK":
-                            new_target = cur * (1 - pct / 100.0)
-                        else:
-                            new_target = cur * (1 + pct / 100.0)
-
-                        await db_exec(
-                            "UPDATE alerts SET target_price=$1, triggered=0, triggered_at=NULL WHERE id=$2",
-                            (float(new_target), alert_id)
-                        )
-
-                    else:
-                        # В новой логике triggered не используем: алерт всегда «вооружён»
-                        pass
+                new_target = cur * (1 - pct / 100.0) if t == "RISK" else cur * (1 + pct / 100.0)
+                await db_exec(
+                    "UPDATE alerts SET target_price=$1, triggered=0, triggered_at=NULL WHERE id=$2",
+                    (float(new_target), alert_id)
+                )
 
         except Exception as e:
             log.exception("alerts_loop error: %r", e)
@@ -1928,9 +2164,13 @@ async def snapshots_loop():
                 ids = list({a["coingecko_id"] for a in assets})
                 price_map = await cg.simple_prices_usd(ids)
                 known = sum(1 for cid in ids if cid in price_map)
-                if known != len(ids):
-                    log.warning("Skip snapshot for uid=%s: prices coverage %d/%d", uid, known, len(ids))
+                if known == 0:
+                    log.warning("Skip snapshot for uid=%s: no prices", uid)
                     continue
+
+                incomplete = known != len(ids)
+                if incomplete:
+                    log.warning("Partial snapshot uid=%s: prices %d/%d", uid, known, len(ids))
 
                 total_invested = 0.0
                 total_value = 0.0
@@ -1952,37 +2192,45 @@ async def snapshots_loop():
                     if cp is not None:
                         total_value += qty * float(cp)
 
-                await insert_snapshot(uid, total_value=total_value, total_invested=total_invested)
+                await insert_snapshot(
+                    uid,
+                    total_value=total_value,
+                    total_invested=total_invested,
+                    incomplete=incomplete
+                )
         except Exception as e:
             log.exception("snapshots_loop error: %r", e)
 
         await asyncio.sleep(SNAPSHOT_EVERY_SECONDS)
 
-async def digest_loop(bot: Bot):
-    CHECK_INTERVAL_SEC = 300  # каждые 5 минут
+async def digest_loop():
     while True:
-        try:
-            now = datetime.now(timezone.utc)
-            yyyymmdd = now.year * 10000 + now.month * 100 + now.day
-            is_time = now.hour == 18  # 18:00 UTC час
-            if is_time:
-                users = await all_users()
-                for uid in users:
-                    enabled = await get_digest_enabled(uid)
-                    if not enabled:
-                        continue
-                    last_sent = await get_last_digest_sent_date(uid)
-                    if last_sent == yyyymmdd:
-                        continue  # уже отправляли сегодня
-                    try:
-                        await send_digest(bot, uid)
-                        await set_last_digest_sent_date(uid, yyyymmdd)
-                    except Exception:
-                        log.exception("digest send failed uid=%s", uid)
-        except Exception as e:
-            log.exception("digest_loop error: %r", e)
+        now = datetime.now(timezone.utc)
+        target = now.replace(hour=18, minute=0, second=0, microsecond=0)
+        if now >= target:
+            target += timedelta(days=1)
 
-        await asyncio.sleep(CHECK_INTERVAL_SEC)
+        sleep_for = max(0.0, (target - now).total_seconds())
+        await asyncio.sleep(sleep_for)
+
+        date_key = target.year * 10000 + target.month * 100 + target.day
+
+        while True:
+            try:
+                rows = await list_digest_enabled_users()
+                for row in rows:
+                    user_id = int(row["user_id"])
+                    tz_name = row.get("tz") or "UTC"
+                    last_sent = row.get("last_digest_sent_date")
+                    if last_sent == date_key:
+                        continue
+                    sent = await send_digest(user_id, tz_name=tz_name)
+                    if sent:
+                        await set_last_digest_sent_date(user_id, date_key)
+                break
+            except Exception as e:
+                log.exception("digest_loop error: %r", e)
+                await asyncio.sleep(60)
 
 # ---------------------------- main ----------------------------
 async def main():
@@ -2013,11 +2261,11 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    alert_task = asyncio.create_task(alerts_loop(bot))
+    send_worker = asyncio.create_task(send_queue_worker(bot))
+    alert_task = asyncio.create_task(alerts_loop())
     snap_task = asyncio.create_task(snapshots_loop())
-
-    digest_task = asyncio.create_task(digest_loop(bot))
-    tasks = (health_task, alert_task, snap_task, digest_task)
+    digest_task = asyncio.create_task(digest_loop())
+    tasks = (health_task, send_worker, alert_task, snap_task, digest_task)
 
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
@@ -2037,7 +2285,6 @@ async def main():
 
         if pg_pool is not None:
             await pg_pool.close()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
