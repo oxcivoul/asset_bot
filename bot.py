@@ -61,9 +61,9 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 PG_POOL_SIZE = int(os.getenv("PG_POOL_SIZE", "5"))
 
 PRICE_POLL_SECONDS = int(os.getenv("PRICE_POLL_SECONDS", "180"))
-PRICE_TTL_SEC = int(os.getenv("PRICE_TTL_SEC", "180"))
+PRICE_TTL_SEC = int(os.getenv("PRICE_TTL_SEC", "300"))  # было 180
 SNAPSHOT_EVERY_SECONDS = int(os.getenv("SNAPSHOT_EVERY_SECONDS", "14400"))
-SUMMARY_CACHE_TTL_SEC = int(os.getenv("SUMMARY_CACHE_TTL_SEC", str(PRICE_TTL_SEC)))
+SUMMARY_CACHE_TTL_SEC = int(os.getenv("SUMMARY_CACHE_TTL_SEC", str(PRICE_TTL_SEC)))  # держим кэш дольше
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN. Put it into your .env (BOT_TOKEN=...)")
@@ -131,6 +131,20 @@ async def send_queue_worker(bot: Bot):
                 if retries >= 5:
                     break
         send_queue.task_done()
+
+SUMMARY_REFRESH_LOCK = asyncio.Lock()
+
+async def summary_cooldown_seconds(user_id: int) -> int:
+    row = await db_fetchone(
+        "SELECT last_summary_cached_at FROM users WHERE user_id=$1",
+        (user_id,)
+    )
+    ts = (row or {}).get("last_summary_cached_at")
+    if not ts:
+        return 0
+    age = time.time() - float(ts)
+    remain = SUMMARY_CACHE_TTL_SEC - age
+    return int(remain) if remain > 0 else 0
 
 # ---------------------------- UI helpers ----------------------------
 def main_menu_kb() -> ReplyKeyboardMarkup:
@@ -235,7 +249,7 @@ class CoinGeckoClient:
         # NEW: limiter (simple spacing between requests)
         self._rl_lock = asyncio.Lock()
         self._last_request_ts = 0.0
-        self._min_interval_sec = float(os.getenv("COINGECKO_MIN_INTERVAL_SEC", "0.8"))
+        self._min_interval_sec = float(os.getenv("COINGECKO_MIN_INTERVAL_SEC", "1.6"))
         # 0.8–1.0 сек — быстрее ответа, но всё ещё щадяще для free-tier
 
         # NEW: adaptive backoff (when CoinGecko returns 429)
@@ -320,7 +334,6 @@ class CoinGeckoClient:
 
                     await self._rate_limit_wait()
 
-                    # network request (rate-limit already applied)
                     async with s.get(url, params=params) as r:
                         status = r.status
                         text = await r.text()
@@ -332,14 +345,12 @@ class CoinGeckoClient:
                         except Exception as e:
                             raise RuntimeError(f"CoinGecko bad JSON ({path}): {text[:200]}") from e
 
-                        # stats
                         dur = time.perf_counter() - t0
                         self._stats_calls += 1
                         self._stats_time += dur
                         if self._stats_calls % 50 == 0:
                             avg = self._stats_time / max(1, self._stats_calls)
                             log.info("CG avg latency=%.3fs calls=%d 429=%d", avg, self._stats_calls, self._stats_429)
-
                         return obj
 
                     if status == 429:
@@ -349,17 +360,12 @@ class CoinGeckoClient:
                             retry_after = float(ra)
                         except Exception:
                             retry_after = 0.0
-
                         self._enable_penalty(retry_after=retry_after)
-
-                        sleep_s = max(retry_after, backoff) + random.random() * 0.25
                         log.warning(
-                            "CoinGecko 429 on %s (attempt %d/%d). Sleep %.2fs. Body=%r",
-                            path, attempt, tries, sleep_s, text[:200]
+                            "CoinGecko 429 on %s (attempt %d/%d). Penalty on. Body=%r",
+                            path, attempt, tries, text[:200]
                         )
-                        await asyncio.sleep(sleep_s)
-                        backoff = min(backoff * 2.0, 30.0)
-                        continue
+                        raise CoinGecko429(retry_after)
 
                     if 500 <= status < 600:
                         log.warning(
@@ -380,6 +386,9 @@ class CoinGeckoClient:
                     )
                     await asyncio.sleep(backoff + random.random() * 0.25)
                     backoff = min(backoff * 2.0, 30.0)
+
+                except CoinGecko429:
+                    raise  # не ретраим 429
 
                 except Exception as e:
                     last_exc = e
@@ -460,6 +469,11 @@ class CoinGeckoClient:
         if return_timestamp:
             return out, data_timestamp
         return out
+
+class CoinGecko429(RuntimeError):
+    def __init__(self, retry_after: float = 0.0):
+        super().__init__("CoinGecko 429")
+        self.retry_after = retry_after
 
 cg = CoinGeckoClient()
 
@@ -746,9 +760,16 @@ async def get_summary_text(user_id: int, *, force_refresh: bool = False) -> str:
         cached = await get_cached_summary(user_id)
         if cached:
             return cached
-    text = await build_summary_text(user_id, force_refresh=force_refresh)
-    await save_summary_cache(user_id, text)
-    return text
+    try:
+        text = await build_summary_text(user_id, force_refresh=force_refresh)
+        await save_summary_cache(user_id, text)
+        return text
+    except CoinGecko429 as e:
+        cached = await get_cached_summary(user_id)
+        if cached:
+            note = "\n\n⚠️ CoinGecko вернул 429, показываю последнюю сохранённую сводку."
+            return cached + note
+        raise
 
 async def send_digest(user_id: int, tz_name: Optional[str] = None) -> bool:
     text = await build_daily_digest_text(user_id, tz_name=tz_name)
@@ -1168,7 +1189,7 @@ async def build_summary_text(user_id: int, *, force_refresh: bool = False) -> st
         "<b>🛠 FAQ</b>",
         f"🕒 Цены CoinGecko: {price_time_text} ({tz_name})",
         f"♻️ TTL кэша: {PRICE_TTL_SEC}s • ручное обновление ≤ 1/3 мин",
-        "/about • /help • /export • /digest • /reset • /settings",
+        "•/about • /help • /export • /digest • /reset • /settings",
     ])
 
     return "📊 <b>Сводка портфеля</b>\n\n" + "\n\n".join(blocks) + "\n\n" + "\n".join(footer_lines)
@@ -1458,11 +1479,22 @@ async def on_reset_no(cb: CallbackQuery, state: FSMContext):
 async def on_summary_refresh(cb: CallbackQuery):
     await upsert_user(cb.from_user.id)
 
-    # один ответ на callback — сразу закрываем “спиннер” (важно для телефона)
-    await cb.answer("Обновляю (цены CoinGecko не чаще 1 раза в 3 минуты)")
+    remain = await summary_cooldown_seconds(cb.from_user.id)
+    if remain > 0:
+        await cb.answer(
+            f"Новые цены будут через {remain}s — CoinGecko даёт их не чаще, чем раз в {math.ceil(SUMMARY_CACHE_TTL_SEC/60)} мин."
+        )
+        return
+
+    if SUMMARY_REFRESH_LOCK.locked():
+        await cb.answer("Уже обновляю — покажу тот же результат.")
+    else:
+        await cb.answer("Обновляю…")
 
     t0 = time.perf_counter()
-    text = await get_summary_text(cb.from_user.id, force_refresh=True)
+    async with SUMMARY_REFRESH_LOCK:
+        text = await get_summary_text(cb.from_user.id, force_refresh=True)
+
     log.info("summary_refresh uid=%s took %.3fs", cb.from_user.id, time.perf_counter() - t0)
 
     try:
