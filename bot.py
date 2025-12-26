@@ -1906,22 +1906,25 @@ async def on_edit_alerts(cb: CallbackQuery, state: FSMContext):
 
     await cb.answer("Не понял")
 
-@router.message(Command("settings"))
-async def on_settings(m: Message):
+@router.message(Command(commands={"settings", "setting"}), state="*")
+async def on_settings(m: Message, state: FSMContext):
+    await state.clear()
     await upsert_user(m.from_user.id)
+
     tz_name = await get_user_tz_name(m.from_user.id)
     digest_on = await get_digest_enabled(m.from_user.id)
     assets = await list_assets(m.from_user.id)
+
     row = await db_fetchone(
         "SELECT last_summary_cached_at FROM users WHERE user_id=$1",
         (m.from_user.id,)
     )
     cache_ts = (row or {}).get("last_summary_cached_at")
-    if cache_ts:
+    if cache_ts is not None:
         age = max(0, SUMMARY_CACHE_TTL_SEC - int(time.time() - cache_ts))
         cache_line = f"Кэш сводки: активен, обновится через {age}s"
     else:
-        cache_line = "Кэш сводки: нет (будет после /summary)"
+        cache_line = "Кэш сводки: нет (появится после первой /summary)"
 
     text = "\n".join([
         "⚙️ <b>Настройки</b>",
