@@ -1053,6 +1053,92 @@ def asset_card(comp: AssetComputed, risk_pcts: List[int], tp_pcts: List[int]) ->
         pnl_line
     ])
 
+def format_top_block(label: str, comp: AssetComputed) -> str:
+    name_part = f" ({escape(comp.name)})" if comp.name else ""
+    pct_text = "—" if comp.pnl_pct is None else sign_pct(comp.pnl_pct)
+    current_value = comp.qty * comp.current if comp.current is not None else 0.0
+    invested_line = (
+        f"Вложено: {money_usd(comp.invested)}"
+        if comp.invested > 0
+        else "Вложено: 0 (free-позиция)"
+    )
+
+    return "\n".join([
+        f"{label}: <b>{escape(comp.symbol)}</b>{name_part}",
+        f"{pnl_icon(comp.pnl_usd or 0.0)} PNL: {sign_money(comp.pnl_usd or 0.0)} ({pct_text})",
+        f"Текущая цена: {fmt_price(comp.current)}",
+        f"Стоимость позиции: {money_usd(current_value)}",
+        f"Количество: {fmt_qty(comp.qty)}",
+        invested_line,
+    ])
+
+
+async def build_top_moves_text(user_id: int) -> str:
+    tz_name = await get_user_tz_name(user_id)
+    tz = resolve_tz(tz_name)
+
+    assets = await list_assets(user_id)
+    if not assets:
+        return (
+            "⚡️ <b>ТОП-движения портфеля</b>\n\n"
+            "Портфель пуст. Добавь актив через меню, чтобы увидеть лидеров и аутсайдеров."
+        )
+
+    ids = sorted({a["coingecko_id"] for a in assets})
+    price_map: Dict[str, float] = {}
+    price_ts: Optional[float] = None
+    try:
+        price_map, price_ts = await cg.simple_prices_usd(ids, return_timestamp=True)
+    except Exception as e:
+        log.warning("top_moves price fetch failed uid=%s err=%r", user_id, e)
+
+    computed: List[AssetComputed] = []
+    for a in assets:
+        current_price = price_map.get(a["coingecko_id"])
+        if current_price is None:
+            continue
+        comp = compute_asset(a, current_price)
+        if comp.pnl_usd is None:
+            continue
+        computed.append(comp)
+
+    if not computed:
+        return (
+            "⚡️ <b>ТОП-движения портфеля</b>\n\n"
+            "Не удалось получить актуальные цены для расчёта. Попробуй позже команду /summary."
+        )
+
+    top_gainer = max(computed, key=lambda c: c.pnl_usd)
+    top_loser = min(computed, key=lambda c: c.pnl_usd)
+    single_asset = top_gainer.asset_id == top_loser.asset_id
+
+    price_dt = datetime.fromtimestamp(price_ts, tz) if price_ts else datetime.now(tz)
+    price_time_text = price_dt.strftime("%H:%M:%S")
+
+    lines = [
+        "⚡️ <b>ТОП-движения портфеля</b>",
+        f"Цены CoinGecko: {price_time_text} ({tz_name})",
+        "",
+        format_top_block("Лидер роста", top_gainer),
+    ]
+
+    if single_asset:
+        lines.extend([
+            "",
+            "В портфеле только один актив, поэтому он же и аутсайдер.",
+        ])
+    else:
+        lines.extend([
+            "",
+            format_top_block("Аутсайдер", top_loser),
+        ])
+
+    lines.extend([
+        "",
+        "Полная детализация: открой кнопку «📊 Сводка» в меню."
+    ])
+    return "\n".join(lines)
+
 async def build_summary_text(user_id: int, *, force_refresh: bool = False) -> str:
     tz_name = await get_user_tz_name(user_id)
     tz = resolve_tz(tz_name)
@@ -1168,7 +1254,7 @@ async def build_summary_text(user_id: int, *, force_refresh: bool = False) -> st
         "<b>🛠 FAQ</b>",
         f"🕒 Цены CoinGecko: {price_time_text} ({tz_name})",
         f"♻️ TTL кэша: {PRICE_TTL_SEC}s • ручное обновление ≤ 1/3 мин",
-        "•/about • /help • /export • /digest • /reset • /settings",
+        "• /about • /help • /digest • /reset • /settings",
     ])
 
     return "📊 <b>Сводка портфеля</b>\n\n" + "\n\n".join(blocks) + "\n\n" + "\n".join(footer_lines)
@@ -1239,7 +1325,7 @@ async def build_daily_digest_text(user_id: int, tz_name: Optional[str] = None) -
         f"Общий PNL: {pnl_icon(total_pnl)} {sign_money(total_pnl)} ({pct_text})",
         f"Портфель: {money_usd(total_value)} • Вложено: {money_usd(total_invested)}",
         f"Цены CoinGecko: {price_time_text} ({tz_name})",
-        "Нужны детали? Введи /summary.",
+        "Хочешь увидеть топ-движения? Введи /summary.",
     ]
     return "\n".join(lines)
 
@@ -1380,6 +1466,12 @@ async def on_about(m: Message):
         "Репо: https://github.com/oxcivoul/asset_bot"
     )
 
+@router.message(Command("summary"))
+async def on_summary_cmd(m: Message):
+    await upsert_user(m.from_user.id)
+    text = await build_top_moves_text(m.from_user.id)
+    await m.answer(text)
+
 @router.message(F.text == "📊 Сводка")
 async def on_summary(m: Message):
     await upsert_user(m.from_user.id)
@@ -1393,38 +1485,6 @@ async def on_reset(m: Message):
         "Вы уверены, что хотите удалить ВСЕ свои активы и снимки PNL? Это действие необратимо.",
         reply_markup=reset_confirm_kb()
     )
-
-@router.message(Command("export"))
-async def on_export(m: Message):
-    assets, alerts_by_asset = await list_assets_with_alerts(m.from_user.id)
-    if not assets:
-        return await m.answer("Экспортировать нечего — активов нет.", reply_markup=main_menu_kb())
-
-    lines = ["symbol,name,qty,entry_price,invested_usd,alerts"]
-    for a in assets:
-        invested = float(a["invested_usd"])
-        entry = float(a["entry_price"])
-        qty_override = float(a.get("qty_override") or 0.0)
-        if qty_override > 0:
-            qty = qty_override
-        elif entry > 0 and invested > 0:
-            qty = invested / entry
-        else:
-            qty = 0.0
-
-        alerts = alerts_by_asset.get(a["id"], []) or []
-        risk = sorted({-int(r["pct"]) for r in alerts if r.get("type") == "RISK"})
-        tp = sorted({int(r["pct"]) for r in alerts if r.get("type") == "TP"})
-        alert_parts = [str(p) for p in risk + tp]
-        alert_str = ";".join(alert_parts)
-
-        lines.append(
-            f"{a['symbol']},{(a.get('name') or '').replace(',',' ')},{qty},{entry},{invested},{alert_str}"
-        )
-
-    csv_data = "\n".join(lines).encode("utf-8")
-    buf = BufferedInputFile(csv_data, filename="portfolio.csv")
-    await m.answer_document(buf, caption="Экспорт готов.")
 
 @router.message(Command("tz"))
 async def on_tz(m: Message):
