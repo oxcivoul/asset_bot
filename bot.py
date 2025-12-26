@@ -1552,18 +1552,33 @@ async def on_reset_no(cb: CallbackQuery, state: FSMContext):
 async def on_summary_refresh(cb: CallbackQuery):
     await upsert_user(cb.from_user.id)
 
-    # один ответ на callback — сразу закрываем “спиннер” (важно для телефона)
-    await cb.answer("Обновляю (цены CoinGecko не чаще 1 раза в 3 минуты)")
+    row = await db_fetchone(
+        "SELECT last_summary_cached_at FROM users WHERE user_id=$1",
+        (cb.from_user.id,)
+    )
+    last_ts = float(row["last_summary_cached_at"]) if row and row.get("last_summary_cached_at") else None
+    now = time.time()
 
-    t0 = time.perf_counter()
-    text = await get_summary_text(cb.from_user.id, force_refresh=True)
-    log.info("summary_refresh uid=%s took %.3fs", cb.from_user.id, time.perf_counter() - t0)
+    use_cache = last_ts is not None and (now - last_ts) < SUMMARY_CACHE_TTL_SEC
+    if use_cache:
+        wait_left = int(SUMMARY_CACHE_TTL_SEC - (now - last_ts))
+        await cb.answer(f"Показываю кэш. Новые цены через ~{max(wait_left, 0)} s")
+        text = await get_summary_text(cb.from_user.id, force_refresh=False)
+    else:
+        await cb.answer("Запрашиваю свежие цены CoinGecko…")
+        t0 = time.perf_counter()
+        text = await get_summary_text(cb.from_user.id, force_refresh=True)
+        log.info(
+            "summary_refresh uid=%s took %.3fs (fresh)",
+            cb.from_user.id,
+            time.perf_counter() - t0
+        )
 
     try:
         await cb.message.edit_text(text, reply_markup=summary_kb())
     except TelegramBadRequest as e:
         if "message is not modified" in str(e):
-            await cb.answer("Актуально")
+            await cb.answer("У тебя уже самая свежая версия 👍")
             return
         raise
 
