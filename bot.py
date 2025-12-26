@@ -15,7 +15,7 @@ from aiohttp import web
 import asyncpg
 
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.types import (
     Message, CallbackQuery,
     ReplyKeyboardMarkup, KeyboardButton,
@@ -1906,7 +1906,7 @@ async def on_edit_alerts(cb: CallbackQuery, state: FSMContext):
 
     await cb.answer("Не понял")
 
-@router.message(Command(commands={"settings", "setting"}), state="*")
+@router.message(Command(commands={"settings", "setting"}), StateFilter("*"))
 async def on_settings(m: Message, state: FSMContext):
     await state.clear()
     await upsert_user(m.from_user.id)
