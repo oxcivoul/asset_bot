@@ -1500,7 +1500,7 @@ async def on_settings(m: Message, state: FSMContext):
         cache_line,
         "",
         "Команды:",
-        "/tz <Region/City> — изменить часовой пояс",
+        "/tz &lt;Region/City&gt; — изменить часовой пояс",
         "/digest — вкл/выкл дайджест",
         "/reset — сбросить данные"
     ])
