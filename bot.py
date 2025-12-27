@@ -1259,7 +1259,7 @@ async def build_summary_text(user_id: int, *, force_refresh: bool = False) -> st
         price_map, missing, price_ts = await ensure_prices(
             ids,
             max_age=0 if force_refresh else PRICE_POLL_SECONDS,
-            direct_ttl=PRICE_TTL_SEC,
+            direct_ttl=0 if force_refresh else PRICE_TTL_SEC,
             need_timestamp=True
         )
         if missing:
