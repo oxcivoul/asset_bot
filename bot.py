@@ -1259,7 +1259,7 @@ async def build_summary_text(user_id: int, *, force_refresh: bool = False) -> st
         price_map, missing, price_ts = await ensure_prices(
             ids,
             max_age=0 if force_refresh else PRICE_POLL_SECONDS,
-            direct_ttl=PRICE_TTL_SEC if not force_refresh else 0,
+            direct_ttl=PRICE_TTL_SEC,
             need_timestamp=True
         )
         if missing:
@@ -2285,8 +2285,32 @@ async def price_feed_loop():
                 await asyncio.sleep(PRICE_POLL_SECONDS)
                 continue
 
-            price_map = await cg.simple_prices_usd(ids, ttl_sec=0)
-            await price_feed_store(price_map)
+            now = time.time()
+            stale_ids = [
+                cid for cid in ids
+                if (now - price_direct_last_fetch.get(cid, 0)) >= PRICE_TTL_SEC
+            ]
+            if not stale_ids:
+                await asyncio.sleep(PRICE_POLL_SECONDS)
+                continue
+
+            CHUNK = int(os.getenv("COINGECKO_SIMPLE_PRICE_CHUNK", "60"))
+            for i in range(0, len(stale_ids), CHUNK):
+                chunk = stale_ids[i:i + CHUNK]
+                try:
+                    fresh = await cg.simple_prices_usd(chunk, ttl_sec=PRICE_TTL_SEC)
+                except Exception as e:
+                    log.warning("price_feed_loop chunk %d-%d failed: %r", i, i + len(chunk), e)
+                    continue
+
+                await price_feed_store(fresh)
+
+                fetch_ts = time.time()
+                for cid in chunk:
+                    price_direct_last_fetch[cid] = fetch_ts
+
+                if i + CHUNK < len(stale_ids):
+                    await asyncio.sleep(0.25)
         except Exception as e:
             log.exception("price_feed_loop error: %r", e)
 
