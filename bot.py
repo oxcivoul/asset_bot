@@ -2289,6 +2289,7 @@ async def price_feed_loop():
             stale_ids = [
                 cid for cid in ids
                 if (now - price_direct_last_fetch.get(cid, 0)) >= PRICE_TTL_SEC
+                or cid not in price_direct_last_fetch
             ]
             if not stale_ids:
                 await asyncio.sleep(PRICE_POLL_SECONDS)
