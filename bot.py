@@ -60,7 +60,7 @@ DB_BACKEND = os.getenv("DB_BACKEND", "postgres").strip().lower()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 PG_POOL_SIZE = int(os.getenv("PG_POOL_SIZE", "5"))
 
-PRICE_POLL_SECONDS = int(os.getenv("PRICE_POLL_SECONDS", "180"))
+PRICE_POLL_SECONDS = int(os.getenv("PRICE_POLL_SECONDS", "60"))
 PRICE_TTL_SEC = int(os.getenv("PRICE_TTL_SEC", "180"))
 SNAPSHOT_EVERY_SECONDS = int(os.getenv("SNAPSHOT_EVERY_SECONDS", "14400"))
 SUMMARY_CACHE_TTL_SEC = int(os.getenv("SUMMARY_CACHE_TTL_SEC", str(PRICE_TTL_SEC)))
@@ -2174,7 +2174,7 @@ async def alerts_loop():
                 continue
 
             ids = list({r["coingecko_id"] for r in rows if r.get("coingecko_id")})
-            price_map = await cg.simple_prices_usd(ids)
+            price_map = await cg.simple_prices_usd(ids, ttl_sec=0)
 
             for r in rows:
                 cid = r.get("coingecko_id")
@@ -2187,9 +2187,21 @@ async def alerts_loop():
                 target = float(r["target_price"])
                 pct = int(r["pct"])
                 alert_id = int(r["alert_id"])
-
                 hit = (cur <= target) if t == "RISK" else (cur >= target)
                 if not hit:
+                    continue
+
+                step = 1 - pct / 100.0 if t == "RISK" else 1 + pct / 100.0
+                if step <= 0:
+                    continue
+
+                steps = 0
+                next_target = target
+                while (t == "RISK" and cur <= next_target) or (t == "TP" and cur >= next_target):
+                    steps += 1
+                    next_target *= step
+
+                if steps == 0:
                     continue
 
                 invested = float(r["invested_usd"])
@@ -2213,19 +2225,21 @@ async def alerts_loop():
                 sym = str(r["symbol"] or "")
                 move_icon = "🔴" if t == "RISK" else "🟢"
                 move_text = f"Цена снизилась на {pct}%" if t == "RISK" else f"Цена увеличилась на {pct}%"
+                if steps > 1:
+                    move_text += f" ×{steps} (перепрыгнуло уровней)"
 
                 text = "\n".join([
                     f"<b>🔔 АЛЕРТ: {escape(sym)}</b>",
                     f"{move_icon} {move_text}",
                     f"Текущая цена: {fmt_price(cur)}",
                     f"{pnl_icon(pnl_usd)} PNL сейчас: {sign_money(pnl_usd)} ({pct_text})",
+                    f"Следующий уровень: {fmt_price(next_target)}",
                 ])
                 await queue_text_message(int(r["user_id"]), text)
 
-                new_target = cur * (1 - pct / 100.0) if t == "RISK" else cur * (1 + pct / 100.0)
                 await db_exec(
                     "UPDATE alerts SET target_price=$1, triggered=0, triggered_at=NULL WHERE id=$2",
-                    (float(new_target), alert_id)
+                    (float(next_target), alert_id)
                 )
 
         except Exception as e:
