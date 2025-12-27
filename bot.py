@@ -464,6 +464,35 @@ class CoinGeckoClient:
 
 cg = CoinGeckoClient()
 
+latest_prices: Dict[str, Tuple[float, float]] = {}
+latest_prices_lock = asyncio.Lock()
+
+async def price_feed_store(new_map: Dict[str, float]):
+    if not new_map:
+        return
+    async with latest_prices_lock:
+        now = time.time()
+        for cid, price in new_map.items():
+            latest_prices[cid] = (now, float(price))
+
+async def price_feed_get(ids: List[str], *, max_age: float) -> Tuple[Dict[str, float], List[str]]:
+    if not ids:
+        return {}, []
+
+    cutoff = time.time() - max_age
+    out: Dict[str, float] = {}
+    missing: List[str] = []
+
+    async with latest_prices_lock:
+        for cid in ids:
+            rec = latest_prices.get(cid)
+            if rec and rec[0] >= cutoff:
+                out[cid] = rec[1]
+            else:
+                missing.append(cid)
+
+    return out, missing
+
 # ---------------------------- DB (Postgres / Neon) ----------------------------
 pg_pool: Optional[asyncpg.Pool] = None
 INSTANCE_LOCK_KEY = int(os.getenv("INSTANCE_LOCK_KEY", "912345678901234567"))
@@ -1156,11 +1185,21 @@ async def build_summary_text(user_id: int, *, force_refresh: bool = False) -> st
     price_map: Dict[str, float] = {}
     price_ts: Optional[float] = None
     try:
-        price_map, price_ts = await cg.simple_prices_usd(
-            ids,
-            ttl_sec=0 if force_refresh else PRICE_TTL_SEC,
-            return_timestamp=True
-        )
+        max_age = 0 if force_refresh else 30
+        price_map, missing = await price_feed_get(ids, max_age=max_age)
+
+        if missing:
+            fresh_map, price_ts = await cg.simple_prices_usd(
+                missing,
+                ttl_sec=0 if force_refresh else PRICE_TTL_SEC,
+                return_timestamp=True
+            )
+            await price_feed_store(fresh_map)
+            price_map.update(fresh_map)
+        else:
+            async with latest_prices_lock:
+                ts_list = [latest_prices[cid][0] for cid in ids if cid in latest_prices]
+            price_ts = min(ts_list) if ts_list else None
     except Exception as e:
         log.warning("Price fetch failed: %r", e)
 
@@ -2198,6 +2237,7 @@ async def alerts_loop():
                 last_price_ids = ids
                 last_price_fetch_ts = now_ts
 
+            await price_feed_store(price_map)
             for r in rows:
                 cid = r.get("coingecko_id")
                 current = price_map.get(cid)
@@ -2279,7 +2319,11 @@ async def snapshots_loop():
                     continue
 
                 ids = list({a["coingecko_id"] for a in assets})
-                price_map = await cg.simple_prices_usd(ids)
+                price_map, missing = await price_feed_get(ids, max_age=120)
+                if missing:
+                    fresh = await cg.simple_prices_usd(missing)
+                    await price_feed_store(fresh)
+                    price_map.update(fresh)
                 known = sum(1 for cid in ids if cid in price_map)
                 if known == 0:
                     log.warning("Skip snapshot for uid=%s: no prices", uid)
