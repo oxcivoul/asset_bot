@@ -2218,10 +2218,6 @@ async def on_digest(m: Message):
 
 # ---------------------------- background loops ----------------------------
 async def alerts_loop():
-    last_price_fetch_ts = 0.0
-    last_price_map: Dict[str, float] = {}
-    last_price_ids: Tuple[str, ...] = ()
-
     while True:
         try:
             rows = await pending_alerts_joined()
@@ -2234,20 +2230,11 @@ async def alerts_loop():
                 await asyncio.sleep(PRICE_POLL_SECONDS + random.uniform(0, 5))
                 continue
 
-            now_ts = time.time()
-            use_cache = (
-                last_price_map
-                and ids == last_price_ids
-                and (now_ts - last_price_fetch_ts) < ALERT_PRICE_CACHE_SEC
-            )
-
-            if use_cache:
-                price_map = dict(last_price_map)
-            else:
-                price_map = await cg.simple_prices_usd(list(ids), ttl_sec=0)
-                last_price_map = dict(price_map)
-                last_price_ids = ids
-                last_price_fetch_ts = now_ts
+            price_map, missing = await price_feed_get(list(ids), max_age=ALERT_PRICE_CACHE_SEC)
+            if missing:
+                fresh = await cg.simple_prices_usd(missing, ttl_sec=0)
+                await price_feed_store(fresh)
+                price_map.update(fresh)
 
             await price_feed_store(price_map)
             for r in rows:
