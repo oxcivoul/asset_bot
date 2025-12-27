@@ -64,7 +64,8 @@ PRICE_POLL_SECONDS = int(os.getenv("PRICE_POLL_SECONDS", "60"))
 PRICE_TTL_SEC = int(os.getenv("PRICE_TTL_SEC", "180"))
 SNAPSHOT_EVERY_SECONDS = int(os.getenv("SNAPSHOT_EVERY_SECONDS", "14400"))
 SUMMARY_CACHE_TTL_SEC = int(os.getenv("SUMMARY_CACHE_TTL_SEC", str(PRICE_TTL_SEC)))
-ALERT_PRICE_CACHE_SEC = int(os.getenv("ALERT_PRICE_CACHE_SEC", "30"))
+DEFAULT_ALERT_PRICE_CACHE = max(PRICE_POLL_SECONDS + 5, PRICE_TTL_SEC)
+ALERT_PRICE_CACHE_SEC = int(os.getenv("ALERT_PRICE_CACHE_SEC", str(DEFAULT_ALERT_PRICE_CACHE)))
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN. Put it into your .env (BOT_TOKEN=...)")
@@ -237,8 +238,8 @@ class CoinGeckoClient:
         # NEW: limiter (simple spacing between requests)
         self._rl_lock = asyncio.Lock()
         self._last_request_ts = 0.0
-        self._min_interval_sec = float(os.getenv("COINGECKO_MIN_INTERVAL_SEC", "0.8"))
-        # 0.8–1.0 сек — быстрее ответа, но всё ещё щадяще для free-tier
+        self._min_interval_sec = float(os.getenv("COINGECKO_MIN_INTERVAL_SEC", "1.2"))
+        # 1.2 c ≈ 50 запросов/мин — соответствует лимиту free-tier без 429
 
         # NEW: adaptive backoff (when CoinGecko returns 429)
         self._base_min_interval_sec = self._min_interval_sec
@@ -467,6 +468,7 @@ cg = CoinGeckoClient()
 
 latest_prices: Dict[str, Tuple[float, float]] = {}
 latest_prices_lock = asyncio.Lock()
+price_direct_last_fetch: Dict[str, float] = {}
 
 async def price_feed_store(new_map: Dict[str, float]):
     if not new_map:
@@ -493,6 +495,67 @@ async def price_feed_get(ids: List[str], *, max_age: float) -> Tuple[Dict[str, f
                 missing.append(cid)
 
     return out, missing
+
+async def ensure_prices(
+    ids: List[str],
+    *,
+    max_age: float,
+    direct_ttl: float,
+    need_timestamp: bool = False
+) -> Tuple[Dict[str, float], List[str], Optional[float]]:
+    if not ids:
+        return {}, [], None
+
+    price_map, missing = await price_feed_get(ids, max_age=max_age)
+
+    price_ts: Optional[float] = None
+    if need_timestamp and price_map:
+        async with latest_prices_lock:
+            ts_candidates = [
+                latest_prices[cid][0]
+                for cid in ids
+                if cid in latest_prices
+            ]
+        if ts_candidates:
+            price_ts = min(ts_candidates)
+
+    if not missing:
+        return price_map, missing, price_ts
+
+    now = time.time()
+    to_fetch = [
+        cid for cid in missing
+        if (now - price_direct_last_fetch.get(cid, 0)) >= direct_ttl
+    ]
+
+    if to_fetch:
+        result = await cg.simple_prices_usd(
+            to_fetch,
+            ttl_sec=direct_ttl,
+            return_timestamp=need_timestamp
+        )
+        if need_timestamp:
+            fresh_map, fresh_ts = result
+        else:
+            fresh_map = result
+            fresh_ts = None
+
+        await price_feed_store(fresh_map)
+        price_map.update(fresh_map)
+
+        fetch_ts = fresh_ts or time.time()
+        for cid in to_fetch:
+            price_direct_last_fetch[cid] = fetch_ts
+
+        if need_timestamp:
+            if price_ts is None:
+                price_ts = fetch_ts
+            else:
+                price_ts = min(price_ts, fetch_ts)
+
+        missing = [cid for cid in missing if cid not in fresh_map]
+
+    return price_map, missing, price_ts
 
 # ---------------------------- DB (Postgres / Neon) ----------------------------
 pg_pool: Optional[asyncpg.Pool] = None
@@ -1119,21 +1182,16 @@ async def build_top_moves_text(user_id: int) -> str:
     price_map: Dict[str, float] = {}
     price_ts: Optional[float] = None
     try:
-        price_map, missing = await price_feed_get(ids, max_age=60)
+        price_map, missing, price_ts = await ensure_prices(
+            ids,
+            max_age=PRICE_POLL_SECONDS,
+            direct_ttl=PRICE_TTL_SEC,
+            need_timestamp=True
+        )
         if missing:
-            fresh_map, price_ts = await cg.simple_prices_usd(
-                missing,
-                ttl_sec=PRICE_TTL_SEC,
-                return_timestamp=True
-            )
-            await price_feed_store(fresh_map)
-            price_map.update(fresh_map)
-        else:
-            async with latest_prices_lock:
-                ts_list = [latest_prices[cid][0] for cid in ids if cid in latest_prices]
-            price_ts = min(ts_list) if ts_list else None
+            log.warning("Top moves: missing prices for %s", ", ".join(missing))
     except Exception as e:
-        log.warning("Daily digest price fetch failed: %r", e)
+        log.warning("Top moves price fetch failed: %r", e)
 
     computed: List[AssetComputed] = []
     for a in assets:
@@ -1198,23 +1256,16 @@ async def build_summary_text(user_id: int, *, force_refresh: bool = False) -> st
     price_map: Dict[str, float] = {}
     price_ts: Optional[float] = None
     try:
-        max_age = 0 if force_refresh else 30
-        price_map, missing = await price_feed_get(ids, max_age=max_age)
-
+        price_map, missing, price_ts = await ensure_prices(
+            ids,
+            max_age=0 if force_refresh else PRICE_POLL_SECONDS,
+            direct_ttl=PRICE_TTL_SEC if not force_refresh else 0,
+            need_timestamp=True
+        )
         if missing:
-            fresh_map, price_ts = await cg.simple_prices_usd(
-                missing,
-                ttl_sec=0 if force_refresh else PRICE_TTL_SEC,
-                return_timestamp=True
-            )
-            await price_feed_store(fresh_map)
-            price_map.update(fresh_map)
-        else:
-            async with latest_prices_lock:
-                ts_list = [latest_prices[cid][0] for cid in ids if cid in latest_prices]
-            price_ts = min(ts_list) if ts_list else None
+            log.warning("Summary: missing prices for %s", ", ".join(missing))
     except Exception as e:
-        log.warning("Daily digest price fetch failed: %r", e)
+        log.warning("Summary price fetch failed: %r", e)
 
     price_dt = datetime.fromtimestamp(price_ts, tz) if price_ts else datetime.now(tz)
     price_time_text = price_dt.strftime("%H:%M:%S")
@@ -1333,19 +1384,14 @@ async def build_daily_digest_text(user_id: int, tz_name: Optional[str] = None) -
     price_map: Dict[str, float] = {}
     price_ts: Optional[float] = None
     try:
-        price_map, missing = await price_feed_get(ids, max_age=60)
+        price_map, missing, price_ts = await ensure_prices(
+            ids,
+            max_age=PRICE_POLL_SECONDS,
+            direct_ttl=PRICE_TTL_SEC,
+            need_timestamp=True
+        )
         if missing:
-            fresh_map, price_ts = await cg.simple_prices_usd(
-                missing,
-                ttl_sec=PRICE_TTL_SEC,
-                return_timestamp=True
-            )
-            await price_feed_store(fresh_map)
-            price_map.update(fresh_map)
-        else:
-            async with latest_prices_lock:
-                ts_list = [latest_prices[cid][0] for cid in ids if cid in latest_prices]
-            price_ts = min(ts_list) if ts_list else None
+            log.warning("Daily digest: missing prices for %s", ", ".join(missing))
     except Exception as e:
         log.warning("Daily digest price fetch failed: %r", e)
 
@@ -2230,6 +2276,22 @@ async def on_digest(m: Message):
     )
 
 # ---------------------------- background loops ----------------------------
+async def price_feed_loop():
+    while True:
+        try:
+            rows = await db_fetchall("SELECT DISTINCT coingecko_id FROM assets")
+            ids = [str(r["coingecko_id"]) for r in rows if r.get("coingecko_id")]
+            if not ids:
+                await asyncio.sleep(PRICE_POLL_SECONDS)
+                continue
+
+            price_map = await cg.simple_prices_usd(ids, ttl_sec=0)
+            await price_feed_store(price_map)
+        except Exception as e:
+            log.exception("price_feed_loop error: %r", e)
+
+        await asyncio.sleep(PRICE_POLL_SECONDS)
+
 async def alerts_loop():
     while True:
         try:
@@ -2244,10 +2306,44 @@ async def alerts_loop():
                 continue
 
             price_map, missing = await price_feed_get(list(ids), max_age=ALERT_PRICE_CACHE_SEC)
+
             if missing:
-                fresh = await cg.simple_prices_usd(missing, ttl_sec=0)
-                await price_feed_store(fresh)
-                price_map.update(fresh)
+                await asyncio.sleep(1.0)
+                price_map_retry, missing_retry = await price_feed_get(
+                    list(ids),
+                    max_age=ALERT_PRICE_CACHE_SEC
+                )
+                price_map = price_map_retry
+                missing = missing_retry
+
+            if missing:
+                now = time.time()
+                to_fetch = [
+                    cid for cid in missing
+                    if (now - price_direct_last_fetch.get(cid, 0)) >= ALERT_PRICE_CACHE_SEC
+                ]
+
+                if to_fetch:
+                    fresh = await cg.simple_prices_usd(
+                        to_fetch,
+                        ttl_sec=ALERT_PRICE_CACHE_SEC
+                    )
+                    await price_feed_store(fresh)
+                    price_map.update(fresh)
+
+                    fetch_ts = time.time()
+                    for cid in to_fetch:
+                        price_direct_last_fetch[cid] = fetch_ts
+
+                    missing = [cid for cid in missing if cid not in fresh]
+
+                if missing:
+                    log.debug(
+                        "alerts_loop: waiting for price feed refresh (missing: %s)",
+                        ", ".join(missing)
+                    )
+                    await asyncio.sleep(1.0)
+                    continue
 
             await price_feed_store(price_map)
             for r in rows:
@@ -2348,11 +2444,45 @@ async def snapshots_loop():
                     continue
 
                 ids = list({a["coingecko_id"] for a in assets})
-                price_map, missing = await price_feed_get(ids, max_age=120)
+                price_map, missing = await price_feed_get(ids, max_age=PRICE_POLL_SECONDS)
+
                 if missing:
-                    fresh = await cg.simple_prices_usd(missing)
-                    await price_feed_store(fresh)
-                    price_map.update(fresh)
+                    await asyncio.sleep(1.0)
+                    price_map_retry, missing_retry = await price_feed_get(
+                        ids,
+                        max_age=PRICE_POLL_SECONDS
+                    )
+                    price_map = price_map_retry
+                    missing = missing_retry
+
+                if missing:
+                    now = time.time()
+                    to_fetch = [
+                        cid for cid in missing
+                        if (now - price_direct_last_fetch.get(cid, 0)) >= PRICE_TTL_SEC
+                    ]
+
+                    if to_fetch:
+                        fresh = await cg.simple_prices_usd(
+                            to_fetch,
+                            ttl_sec=PRICE_TTL_SEC
+                        )
+                        await price_feed_store(fresh)
+                        price_map.update(fresh)
+
+                        fetch_ts = time.time()
+                        for cid in to_fetch:
+                            price_direct_last_fetch[cid] = fetch_ts
+
+                        missing = [cid for cid in missing if cid not in fresh]
+
+                    if missing:
+                        log.debug(
+                            "snapshots_loop: waiting for price feed refresh (missing: %s)",
+                            ", ".join(missing)
+                        )
+                        await asyncio.sleep(1.0)
+                        continue
                 known = sum(1 for cid in ids if cid in price_map)
                 if known == 0:
                     log.warning("Skip snapshot for uid=%s: no prices", uid)
@@ -2452,10 +2582,11 @@ async def main():
     dp.include_router(router)
 
     send_worker = asyncio.create_task(send_queue_worker(bot))
+    price_task = asyncio.create_task(price_feed_loop())
     alert_task = asyncio.create_task(alerts_loop())
     snap_task = asyncio.create_task(snapshots_loop())
     digest_task = asyncio.create_task(digest_loop())
-    tasks = (health_task, send_worker, alert_task, snap_task, digest_task)
+    tasks = (health_task, send_worker, price_task, alert_task, snap_task, digest_task)
 
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
