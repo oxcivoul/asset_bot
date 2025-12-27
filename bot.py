@@ -64,6 +64,7 @@ PRICE_POLL_SECONDS = int(os.getenv("PRICE_POLL_SECONDS", "60"))
 PRICE_TTL_SEC = int(os.getenv("PRICE_TTL_SEC", "180"))
 SNAPSHOT_EVERY_SECONDS = int(os.getenv("SNAPSHOT_EVERY_SECONDS", "14400"))
 SUMMARY_CACHE_TTL_SEC = int(os.getenv("SUMMARY_CACHE_TTL_SEC", str(PRICE_TTL_SEC)))
+ALERT_PRICE_CACHE_SEC = int(os.getenv("ALERT_PRICE_CACHE_SEC", "30"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN. Put it into your .env (BOT_TOKEN=...)")
@@ -2166,15 +2167,36 @@ async def on_digest(m: Message):
 
 # ---------------------------- background loops ----------------------------
 async def alerts_loop():
+    last_price_fetch_ts = 0.0
+    last_price_map: Dict[str, float] = {}
+    last_price_ids: Tuple[str, ...] = ()
+
     while True:
         try:
             rows = await pending_alerts_joined()
             if not rows:
-                await asyncio.sleep(PRICE_POLL_SECONDS)
+                await asyncio.sleep(PRICE_POLL_SECONDS + random.uniform(0, 5))
                 continue
 
-            ids = list({r["coingecko_id"] for r in rows if r.get("coingecko_id")})
-            price_map = await cg.simple_prices_usd(ids, ttl_sec=0)
+            ids = tuple(sorted({r["coingecko_id"] for r in rows if r.get("coingecko_id")}))
+            if not ids:
+                await asyncio.sleep(PRICE_POLL_SECONDS + random.uniform(0, 5))
+                continue
+
+            now_ts = time.time()
+            use_cache = (
+                last_price_map
+                and ids == last_price_ids
+                and (now_ts - last_price_fetch_ts) < ALERT_PRICE_CACHE_SEC
+            )
+
+            if use_cache:
+                price_map = dict(last_price_map)
+            else:
+                price_map = await cg.simple_prices_usd(list(ids), ttl_sec=0)
+                last_price_map = dict(price_map)
+                last_price_ids = ids
+                last_price_fetch_ts = now_ts
 
             for r in rows:
                 cid = r.get("coingecko_id")
@@ -2245,7 +2267,7 @@ async def alerts_loop():
         except Exception as e:
             log.exception("alerts_loop error: %r", e)
 
-        await asyncio.sleep(PRICE_POLL_SECONDS)
+        await asyncio.sleep(PRICE_POLL_SECONDS + random.uniform(0, 5))
 
 async def snapshots_loop():
     while True:
@@ -2296,7 +2318,7 @@ async def snapshots_loop():
         except Exception as e:
             log.exception("snapshots_loop error: %r", e)
 
-        await asyncio.sleep(SNAPSHOT_EVERY_SECONDS)
+        await asyncio.sleep(SNAPSHOT_EVERY_SECONDS + random.uniform(0, 5))
 
 async def digest_loop():
     while True:
