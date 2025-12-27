@@ -76,6 +76,7 @@ RISK_LEVELS = [5, 10, 25]
 TP_LEVELS = [5, 10, 25]
 ALERT_REARM_PCT = float(os.getenv("ALERT_REARM_PCT", "0.3"))
 # 0.3% = небольшой запас, чтобы алерт не “дребезжал” туда-сюда вокруг target
+ALERT_REARM_FACTOR = max(0.0, ALERT_REARM_PCT / 100.0)
 VERSION = "1.3.0"
 
 async def run_health_server():
@@ -1213,7 +1214,7 @@ async def build_summary_text(user_id: int, *, force_refresh: bool = False) -> st
                 ts_list = [latest_prices[cid][0] for cid in ids if cid in latest_prices]
             price_ts = min(ts_list) if ts_list else None
     except Exception as e:
-        log.warning("Price fetch failed: %r", e)
+        log.warning("Daily digest price fetch failed: %r", e)
 
     price_dt = datetime.fromtimestamp(price_ts, tz) if price_ts else datetime.now(tz)
     price_time_text = price_dt.strftime("%H:%M:%S")
@@ -1332,7 +1333,19 @@ async def build_daily_digest_text(user_id: int, tz_name: Optional[str] = None) -
     price_map: Dict[str, float] = {}
     price_ts: Optional[float] = None
     try:
-        price_map, price_ts = await cg.simple_prices_usd(ids, return_timestamp=True)
+        price_map, missing = await price_feed_get(ids, max_age=60)
+        if missing:
+            fresh_map, price_ts = await cg.simple_prices_usd(
+                missing,
+                ttl_sec=PRICE_TTL_SEC,
+                return_timestamp=True
+            )
+            await price_feed_store(fresh_map)
+            price_map.update(fresh_map)
+        else:
+            async with latest_prices_lock:
+                ts_list = [latest_prices[cid][0] for cid in ids if cid in latest_prices]
+            price_ts = min(ts_list) if ts_list else None
     except Exception as e:
         log.warning("Daily digest price fetch failed: %r", e)
 
@@ -2248,7 +2261,13 @@ async def alerts_loop():
                 target = float(r["target_price"])
                 pct = int(r["pct"])
                 alert_id = int(r["alert_id"])
-                hit = (cur <= target) if t == "RISK" else (cur >= target)
+
+                rearm_factor = ALERT_REARM_FACTOR
+                trigger_threshold = (
+                    target * (1 - rearm_factor) if t == "RISK" else target * (1 + rearm_factor)
+                )
+
+                hit = (cur <= trigger_threshold) if t == "RISK" else (cur >= trigger_threshold)
                 if not hit:
                     continue
 
@@ -2256,13 +2275,13 @@ async def alerts_loop():
                 if step <= 0:
                     continue
 
-                steps = 0
+                triggered_levels: List[float] = []
                 next_target = target
                 while (t == "RISK" and cur <= next_target) or (t == "TP" and cur >= next_target):
-                    steps += 1
+                    triggered_levels.append(next_target)
                     next_target *= step
 
-                if steps == 0:
+                if not triggered_levels:
                     continue
 
                 invested = float(r["invested_usd"])
@@ -2285,18 +2304,29 @@ async def alerts_loop():
 
                 sym = str(r["symbol"] or "")
                 move_icon = "🔴" if t == "RISK" else "🟢"
-                move_text = f"Цена снизилась на {pct}%" if t == "RISK" else f"Цена увеличилась на {pct}%"
-                if steps > 1:
-                    move_text += f" ×{steps} (перепрыгнуло уровней)"
+                move_verb = "снизилась" if t == "RISK" else "выросла"
 
-                text = "\n".join([
-                    f"<b>🔔 АЛЕРТ: {escape(sym)}</b>",
-                    f"{move_icon} {move_text}",
-                    f"Текущая цена: {fmt_price(cur)}",
-                    f"{pnl_icon(pnl_usd)} PNL сейчас: {sign_money(pnl_usd)} ({pct_text})",
-                    f"Следующий уровень: {fmt_price(next_target)}",
-                ])
-                await queue_text_message(int(r["user_id"]), text)
+                for level_price in triggered_levels:
+                    next_level = level_price * step
+                    level_delta_pct = None
+                    if entry > 0:
+                        if t == "RISK":
+                            level_delta_pct = (1 - level_price / entry) * 100.0
+                        else:
+                            level_delta_pct = (level_price / entry - 1) * 100.0
+                    level_delta_text = (
+                        sign_pct(level_delta_pct) if level_delta_pct is not None else f"{pct}%"
+                    )
+
+                    text = "\n".join([
+                        f"<b>🔔 АЛЕРТ: {escape(sym)}</b>",
+                        f"{move_icon} Цена {move_verb} на {pct}% (уровень {fmt_price(level_price)})",
+                        f"Δ от входа: {level_delta_text}",
+                        f"Текущая цена: {fmt_price(cur)}",
+                        f"{pnl_icon(pnl_usd)} PNL сейчас: {sign_money(pnl_usd)} ({pct_text})",
+                        f"Следующий уровень: {fmt_price(next_level)}",
+                    ])
+                    await queue_text_message(int(r["user_id"]), text)
 
                 await db_exec(
                     "UPDATE alerts SET target_price=$1, triggered=0, triggered_at=NULL WHERE id=$2",
