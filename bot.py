@@ -1118,7 +1118,19 @@ async def build_top_moves_text(user_id: int) -> str:
     price_map: Dict[str, float] = {}
     price_ts: Optional[float] = None
     try:
-        price_map, price_ts = await cg.simple_prices_usd(ids, return_timestamp=True)
+        price_map, missing = await price_feed_get(ids, max_age=30)
+        if missing:
+            fresh_map, price_ts = await cg.simple_prices_usd(
+                missing,
+                ttl_sec=PRICE_TTL_SEC,
+                return_timestamp=True
+            )
+            await price_feed_store(fresh_map)
+            price_map.update(fresh_map)
+        else:
+            async with latest_prices_lock:
+                ts_list = [latest_prices[cid][0] for cid in ids if cid in latest_prices]
+            price_ts = min(ts_list) if ts_list else None
     except Exception as e:
         log.warning("top_moves price fetch failed uid=%s err=%r", user_id, e)
 
