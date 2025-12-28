@@ -6,7 +6,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple, Set, Any
-from html import escape
+from html import escape  # понадобится в алертах
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
@@ -2288,30 +2288,29 @@ async def price_feed_loop():
             now = time.time()
             stale_ids = [
                 cid for cid in ids
-                if (now - price_direct_last_fetch.get(cid, 0)) >= PRICE_TTL_SEC
-                or cid not in price_direct_last_fetch
+                if cid not in price_direct_last_fetch
+                or (now - price_direct_last_fetch[cid]) >= PRICE_TTL_SEC
             ]
             if not stale_ids:
                 await asyncio.sleep(PRICE_POLL_SECONDS)
                 continue
 
-            CHUNK = int(os.getenv("COINGECKO_SIMPLE_PRICE_CHUNK", "60"))
-            for i in range(0, len(stale_ids), CHUNK):
-                chunk = stale_ids[i:i + CHUNK]
-                try:
-                    fresh = await cg.simple_prices_usd(chunk, ttl_sec=PRICE_TTL_SEC)
-                except Exception as e:
-                    log.warning("price_feed_loop chunk %d-%d failed: %r", i, i + len(chunk), e)
-                    continue
+            CHUNK = int(os.getenv("COINGECKO_SIMPLE_PRICE_CHUNK", "40"))
+            stale_ids.sort(key=lambda cid: price_direct_last_fetch.get(cid, 0))
+            batch = stale_ids[:CHUNK]
 
-                await price_feed_store(fresh)
+            try:
+                fresh = await cg.simple_prices_usd(batch, ttl_sec=PRICE_TTL_SEC)
+            except Exception as e:
+                log.warning("price_feed_loop batch failed: %r", e)
+                await asyncio.sleep(PRICE_POLL_SECONDS)
+                continue
 
-                fetch_ts = time.time()
-                for cid in chunk:
-                    price_direct_last_fetch[cid] = fetch_ts
+            await price_feed_store(fresh)
 
-                if i + CHUNK < len(stale_ids):
-                    await asyncio.sleep(0.25)
+            fetch_ts = time.time()
+            for cid in batch:
+                price_direct_last_fetch[cid] = fetch_ts
         except Exception as e:
             log.exception("price_feed_loop error: %r", e)
 
@@ -2373,86 +2372,70 @@ async def alerts_loop():
             await price_feed_store(price_map)
             for r in rows:
                 cid = r.get("coingecko_id")
-                current = price_map.get(cid)
-                if current is None:
+
+                current_price = price_map.get(cid)
+                if current_price is None:
                     continue
 
-                cur = float(current)
-                t = str(r.get("type") or "")
+                cur = float(current_price)
+                alert_type = str(r.get("type") or "")
                 target = float(r["target_price"])
                 pct = int(r["pct"])
                 alert_id = int(r["alert_id"])
+                triggered = bool(r.get("triggered"))
 
-                rearm_factor = ALERT_REARM_FACTOR
-                trigger_threshold = (
-                    target * (1 - rearm_factor) if t == "RISK" else target * (1 + rearm_factor)
-                )
+                lower_band = target * (1 - ALERT_REARM_FACTOR)
+                upper_band = target * (1 + ALERT_REARM_FACTOR)
 
-                hit = (cur <= trigger_threshold) if t == "RISK" else (cur >= trigger_threshold)
-                if not hit:
-                    continue
-
-                step = 1 - pct / 100.0 if t == "RISK" else 1 + pct / 100.0
-                if step <= 0:
-                    continue
-
-                triggered_levels: List[float] = []
-                next_target = target
-                while (t == "RISK" and cur <= next_target) or (t == "TP" and cur >= next_target):
-                    triggered_levels.append(next_target)
-                    next_target *= step
-
-                if not triggered_levels:
-                    continue
-
-                invested = float(r["invested_usd"])
-                entry = float(r["entry_price"])
-                qty_override = float(r.get("qty_override") or 0.0)
-
-                if qty_override > 0:
-                    qty = qty_override
-                elif entry > 0 and invested > 0:
-                    qty = invested / entry
-                else:
-                    qty = 0.0
-                if qty == 0:
-                    continue
-
-                base_invested = invested if invested > 0 else (qty * entry if entry > 0 else 0.0)
-                pnl_usd = qty * cur - base_invested
-                pnl_pct = None if base_invested == 0 else (pnl_usd / base_invested * 100.0)
-                pct_text = "—" if pnl_pct is None else sign_pct(pnl_pct)
-
-                sym = str(r["symbol"] or "")
-                move_icon = "🔴" if t == "RISK" else "🟢"
-                move_verb = "снизилась" if t == "RISK" else "выросла"
-
-                for level_price in triggered_levels:
-                    next_level = level_price * step
-                    level_delta_pct = None
-                    if entry > 0:
-                        if t == "RISK":
-                            level_delta_pct = (1 - level_price / entry) * 100.0
-                        else:
-                            level_delta_pct = (level_price / entry - 1) * 100.0
-                    level_delta_text = (
-                        sign_pct(level_delta_pct) if level_delta_pct is not None else f"{pct}%"
+                if triggered:
+                    should_release = (
+                        (alert_type == "RISK" and cur >= upper_band) or
+                        (alert_type == "TP"   and cur <= lower_band)
                     )
+                    if should_release:
+                        await reset_alert_triggered(alert_id)
+                        triggered = False
+                    else:
+                        continue
+
+                if not triggered:
+                    should_fire = (
+                        (alert_type == "RISK" and cur <= lower_band) or
+                        (alert_type == "TP"   and cur >= upper_band)
+                    )
+                    if not should_fire:
+                        continue
+
+                    qty_override = float(r.get("qty_override") or 0.0)
+                    invested = float(r["invested_usd"])
+                    entry = float(r["entry_price"])
+
+                    if qty_override > 0:
+                        qty = qty_override
+                    elif entry > 0 and invested > 0:
+                        qty = invested / entry
+                    else:
+                        qty = 0.0
+                    if qty == 0:
+                        continue
+
+                    base_invested = invested if invested > 0 else qty * entry
+                    pnl_usd = qty * cur - base_invested
+                    pnl_pct = None if base_invested == 0 else pnl_usd / base_invested * 100.0
+                    pct_text = "—" if pnl_pct is None else sign_pct(pnl_pct)
+
+                    icon = "🔴" if alert_type == "RISK" else "🟢"
+                    verb = "снизилась" if alert_type == "RISK" else "выросла"
 
                     text = "\n".join([
-                        f"<b>🔔 АЛЕРТ: {escape(sym)}</b>",
-                        f"{move_icon} Цена {move_verb} на {pct}% (уровень {fmt_price(level_price)})",
-                        f"Δ от входа: {level_delta_text}",
+                        f"<b>🔔 АЛЕРТ: {escape(r['symbol'] or '')}</b>",
+                        f"{icon} Цена {verb} на {pct}% (уровень {fmt_price(target)})",
+                        f"Δ от входа: {sign_pct(pct)}",
                         f"Текущая цена: {fmt_price(cur)}",
                         f"{pnl_icon(pnl_usd)} PNL сейчас: {sign_money(pnl_usd)} ({pct_text})",
-                        f"Следующий уровень: {fmt_price(next_level)}",
                     ])
                     await queue_text_message(int(r["user_id"]), text)
-
-                await db_exec(
-                    "UPDATE alerts SET target_price=$1, triggered=0, triggered_at=NULL WHERE id=$2",
-                    (float(next_target), alert_id)
-                )
+                    await mark_alert_triggered(alert_id)
 
         except Exception as e:
             log.exception("alerts_loop error: %r", e)
