@@ -76,6 +76,7 @@ CACHE_CLEANUP_INTERVAL_SEC = int(os.getenv("CACHE_CLEANUP_INTERVAL_SEC", "900"))
 
 SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "500"))
 SEND_QUEUE_WORKERS = int(os.getenv("SEND_QUEUE_WORKERS", "2"))
+SEND_QUEUE_PUT_TIMEOUT_SEC = float(os.getenv("SEND_QUEUE_PUT_TIMEOUT_SEC", "1.0"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN. Put it into your .env (BOT_TOKEN=...)")
@@ -118,13 +119,57 @@ class SendTask:
 
 send_queue: asyncio.Queue[SendTask] = asyncio.Queue(maxsize=SEND_QUEUE_MAXSIZE)
 
-async def queue_text_message(chat_id: int, text: str, **kwargs):
-    if send_queue.full():
-        log.warning(
-            "Send queue is full (max=%d). Backpressure is building up.",
-            SEND_QUEUE_MAXSIZE
+async def queue_text_message(
+    chat_id: int,
+    text: str,
+    *,
+    timeout: Optional[float] = None,
+    **kwargs
+) -> bool:
+    put_timeout = SEND_QUEUE_PUT_TIMEOUT_SEC if timeout is None else timeout
+    task = SendTask(chat_id=chat_id, text=text, kwargs=kwargs)
+
+    if put_timeout is not None and put_timeout <= 0:
+        try:
+            send_queue.put_nowait(task)
+            return True
+        except asyncio.QueueFull:
+            log.error(
+                "Send queue saturated (size=%d/%d). Drop chat_id=%s",
+                send_queue.qsize(),
+                SEND_QUEUE_MAXSIZE,
+                chat_id
+            )
+            return False
+
+    try:
+        if put_timeout is None:
+            await send_queue.put(task)
+        else:
+            await asyncio.wait_for(send_queue.put(task), timeout=put_timeout)
+        if send_queue.full():
+            log.warning(
+                "Send queue is full (size=%d/%d). Producers may back off.",
+                send_queue.qsize(),
+                SEND_QUEUE_MAXSIZE
+            )
+        return True
+    except asyncio.TimeoutError:
+        log.error(
+            "Send queue put timeout after %.2fs (size=%d/%d). Drop chat_id=%s",
+            put_timeout,
+            send_queue.qsize(),
+            SEND_QUEUE_MAXSIZE,
+            chat_id
         )
-    await send_queue.put(SendTask(chat_id=chat_id, text=text, kwargs=kwargs))
+    except asyncio.QueueFull:
+        log.error(
+            "Send queue saturated (size=%d/%d). Drop chat_id=%s",
+            send_queue.qsize(),
+            SEND_QUEUE_MAXSIZE,
+            chat_id
+        )
+    return False
 
 async def send_queue_worker(bot: Bot, *, worker_id: int):
     while True:
@@ -983,12 +1028,38 @@ async def get_summary_pages(user_id: int, *, force_refresh: bool = False) -> Lis
     pages = paginate_text(full_text, SUMMARY_PAGE_CHAR_LIMIT)
     return pages or [full_text]
 
+async def get_summary_pages_safe(
+    user_id: int,
+    *,
+    force_refresh: bool
+) -> Tuple[Optional[List[str]], Optional[str]]:
+    try:
+        pages = await get_summary_pages(user_id, force_refresh=force_refresh)
+        return pages, None
+    except Exception:
+        log.exception(
+            "get_summary_pages failed (force_refresh=%s) uid=%s",
+            force_refresh,
+            user_id
+        )
+        row = await db_fetchone(
+            "SELECT last_summary_text FROM users WHERE user_id=$1",
+            (user_id,)
+        )
+        cached_text = (row or {}).get("last_summary_text")
+        if cached_text:
+            pages = paginate_text(cached_text, SUMMARY_PAGE_CHAR_LIMIT)
+            warning = "⚠️ CoinGecko недоступен — показываю последнюю сохранённую версию."
+            return pages, warning
+        warning = "⚠️ CoinGecko недоступен. Попробуй чуть позже."
+        return None, warning
+
 async def send_digest(user_id: int, tz_name: Optional[str] = None) -> bool:
     text = await build_daily_digest_text(user_id, tz_name=tz_name)
     if not text:
         return False
-    await queue_text_message(user_id, text)
-    return True
+    queued = await queue_text_message(user_id, text)
+    return queued
 
 async def list_assets(user_id: int):
     return await db_fetchall(
@@ -1128,7 +1199,6 @@ async def recompute_alert_targets(asset_id: int, new_entry: float):
         await replace_alerts(asset_id, updated)
 
 async def pending_alerts_joined():
-    cutoff = int(time.time()) - ALERT_RECENT_RESET_SECONDS
     return await db_fetchall(
         """
         SELECT
@@ -1138,11 +1208,7 @@ async def pending_alerts_joined():
           a.invested_usd, a.entry_price, a.qty_override
         FROM alerts al
         JOIN assets a ON a.id = al.asset_id
-        WHERE
-          al.triggered = 0
-          OR (al.triggered = 1 AND al.triggered_at >= $1)
-        """,
-        (cutoff,)
+        """
     )
 
 async def mark_alert_triggered(alert_id: int):
@@ -1199,6 +1265,7 @@ class AssetComputed:
     name: str
     coingecko_id: str
     invested: float
+    base_invested: float
     entry: float
     qty: float
     current: Optional[float]
@@ -1216,6 +1283,8 @@ def compute_asset(row, current_price: Optional[float]) -> AssetComputed:
     else:
         qty = 0.0
 
+    base_invested = invested if invested > 0 else (qty * entry if entry > 0 else 0.0)
+
     if current_price is None:
         return AssetComputed(
             asset_id=int(row["id"]),
@@ -1223,12 +1292,31 @@ def compute_asset(row, current_price: Optional[float]) -> AssetComputed:
             name=str(row["name"] or ""),
             coingecko_id=str(row["coingecko_id"]),
             invested=invested,
+            base_invested=base_invested,
             entry=entry,
             qty=qty,
             current=None,
             pnl_usd=None,
             pnl_pct=None,
         )
+
+    current_value = qty * float(current_price)
+    pnl_usd = current_value - base_invested
+    pnl_pct = None if base_invested == 0 else (pnl_usd / base_invested * 100.0)
+
+    return AssetComputed(
+        asset_id=int(row["id"]),
+        symbol=str(row["symbol"]),
+        name=str(row["name"] or ""),
+        coingecko_id=str(row["coingecko_id"]),
+        invested=invested,
+        base_invested=base_invested,
+        entry=entry,
+        qty=qty,
+        current=float(current_price),
+        pnl_usd=float(pnl_usd),
+        pnl_pct=None if pnl_pct is None else float(pnl_pct),
+    )
 
     current_value = qty * float(current_price)
 
@@ -1441,7 +1529,7 @@ async def build_summary_text(user_id: int, *, force_refresh: bool = False) -> st
     known_positions = sum(1 for a in assets if a["coingecko_id"] in price_map)
 
     computed: List[AssetComputed] = []
-    total_invested = 0.0
+    total_base_invested = 0.0
     total_value = 0.0
 
     for a in assets:
@@ -1449,7 +1537,7 @@ async def build_summary_text(user_id: int, *, force_refresh: bool = False) -> st
         comp = compute_asset(a, cp)
         computed.append(comp)
 
-        total_invested += comp.invested
+        total_base_invested += comp.base_invested
         if comp.current is not None:
             total_value += comp.qty * comp.current
 
@@ -1509,7 +1597,7 @@ async def build_summary_text(user_id: int, *, force_refresh: bool = False) -> st
 
     footer_lines: List[str] = [
         ("⚠️ Цены: " if known_positions != total_positions else "✅ Цены: ") + coverage_text,
-        f"Вложено: {money_usd(total_invested)}",
+        f"Вложено: {money_usd(total_base_invested)}",
     ]
 
     if known_positions != total_positions:
@@ -1517,8 +1605,8 @@ async def build_summary_text(user_id: int, *, force_refresh: bool = False) -> st
         footer_lines.append("<b>ОБЩИЙ PNL: —</b>")
     else:
         footer_lines.append(f"Текущая стоимость: {money_usd(total_value)}")
-        total_pnl = total_value - total_invested
-        total_pnl_pct = None if total_invested == 0 else (total_pnl / total_invested * 100.0)
+        total_pnl = total_value - total_base_invested
+        total_pnl_pct = None if total_base_invested == 0 else (total_pnl / total_base_invested * 100.0)
         pct_text = "—" if total_pnl_pct is None else sign_pct(total_pnl_pct)
         footer_lines.append(
             f"<b>{pnl_icon(total_pnl)} ОБЩИЙ PNL: {sign_money(total_pnl)} ({pct_text})</b>"
@@ -1574,18 +1662,18 @@ async def build_daily_digest_text(user_id: int, tz_name: Optional[str] = None) -
         )
 
     computed: List[AssetComputed] = []
-    total_invested = 0.0
+    total_base_invested = 0.0
     total_value = 0.0
 
     for asset in assets:
         comp = compute_asset(asset, price_map.get(asset["coingecko_id"]))
         computed.append(comp)
-        total_invested += comp.invested
+        total_base_invested += comp.base_invested
         if comp.current is not None:
             total_value += comp.qty * comp.current
 
-    total_pnl = total_value - total_invested
-    total_pct = None if total_invested == 0 else (total_pnl / total_invested * 100.0)
+    total_pnl = total_value - total_base_invested
+    total_pct = None if total_base_invested == 0 else (total_pnl / total_base_invested * 100.0)
 
     baseline = await get_snapshot_at_or_after(user_id, day_start_ts)
     daily_pnl: Optional[float] = None
@@ -1605,7 +1693,7 @@ async def build_daily_digest_text(user_id: int, tz_name: Optional[str] = None) -
         f"📬 Ежедневный дайджест за {day_label} ({tz_name})",
         daily_line,
         f"Общий PNL: {pnl_icon(total_pnl)} {sign_money(total_pnl)} ({pct_text})",
-        f"Портфель: {money_usd(total_value)} • Вложено: {money_usd(total_invested)}",
+        f"Портфель: {money_usd(total_value)} • Вложено: {money_usd(total_base_invested)}",
         f"Цены CoinGecko: {price_time_text} ({tz_name})",
         "Хочешь увидеть топ-движения? Введи /summary.",
     ]
@@ -1794,7 +1882,12 @@ async def on_settings(m: Message, state: FSMContext):
 @router.message(F.text == "📊 Сводка")
 async def on_summary(m: Message):
     await upsert_user(m.from_user.id)
-    pages = await get_summary_pages(m.from_user.id, force_refresh=False)
+    pages, warning = await get_summary_pages_safe(m.from_user.id, force_refresh=False)
+    if pages is None:
+        await m.answer(warning or "⚠️ CoinGecko недоступен. Попробуй позже.")
+        return
+    if warning:
+        pages[0] = f"{warning}\n\n{pages[0]}"
     total_pages = len(pages)
     page = 0
     msg = await m.answer(pages[page], reply_markup=summary_kb(page, total_pages))
@@ -1839,7 +1932,6 @@ async def on_reset_no(cb: CallbackQuery, state: FSMContext):
 async def on_summary_refresh(cb: CallbackQuery):
     await upsert_user(cb.from_user.id)
 
-    # извлекаем текущую страницу из callback, если есть
     try:
         page = int(cb.data.split(":")[2])
     except Exception:
@@ -1856,19 +1948,18 @@ async def on_summary_refresh(cb: CallbackQuery):
     if use_cache:
         wait_left = int(SUMMARY_CACHE_TTL_SEC - (now - last_ts))
         await cb.answer(f"Показываю кэш. Новые цены через ~{max(wait_left, 0)} s")
-        pages = await get_summary_pages(cb.from_user.id, force_refresh=False)
     else:
         await cb.answer("Запрашиваю свежие цены CoinGecko…")
-        t0 = time.perf_counter()
-        pages = await get_summary_pages(cb.from_user.id, force_refresh=True)
-        log.info(
-            "summary_refresh uid=%s took %.3fs (fresh)",
-            cb.from_user.id,
-            time.perf_counter() - t0
-        )
+
+    pages, warning = await get_summary_pages_safe(cb.from_user.id, force_refresh=not use_cache)
+    if pages is None:
+        await cb.message.answer(warning or "⚠️ CoinGecko недоступен. Попробуй позже.")
+        return
 
     total_pages = len(pages)
     page = max(0, min(page, total_pages - 1))
+    if warning:
+        pages[page] = f"{warning}\n\n{pages[page]}"
 
     try:
         await cb.message.edit_text(pages[page], reply_markup=summary_kb(page, total_pages))
@@ -1886,12 +1977,20 @@ async def on_summary_page(cb: CallbackQuery):
     except Exception:
         return await cb.answer("Некорректная страница")
 
-    pages = await get_summary_pages(cb.from_user.id, force_refresh=False)
+    pages, warning = await get_summary_pages_safe(cb.from_user.id, force_refresh=False)
+    if pages is None:
+        await cb.message.answer(warning or "⚠️ CoinGecko недоступен. Попробуй позже.")
+        await cb.answer("Ошибка")
+        return
+
     total_pages = len(pages)
     if total_pages == 0:
         return await cb.answer("Нет данных")
 
     page = max(0, min(page, total_pages - 1))
+    if warning:
+        pages[page] = f"{warning}\n\n{pages[page]}"
+
     try:
         await cb.message.edit_text(pages[page], reply_markup=summary_kb(page, total_pages))
     except TelegramBadRequest as e:
@@ -2614,10 +2713,7 @@ async def alerts_loop():
                 upper_band = target * (1 + ALERT_REARM_FACTOR)
 
                 if triggered:
-                    should_release = (
-                        (alert_type == "RISK" and cur >= upper_band) or
-                        (alert_type == "TP"   and cur <= lower_band)
-                    )
+                    should_release = (cur <= lower_band) or (cur >= upper_band)
                     if should_release:
                         await reset_alert_triggered(alert_id)
                         triggered = False
@@ -2667,7 +2763,14 @@ async def alerts_loop():
                         f"Текущая цена: {fmt_price(cur)}",
                         f"{pnl_icon(pnl_usd)} PNL сейчас: {sign_money(pnl_usd)} ({pct_text})",
                     ])
-                    await queue_text_message(int(r["user_id"]), text)
+                    queued = await queue_text_message(int(r["user_id"]), text)
+                    if not queued:
+                        log.error(
+                            "alerts_loop: drop alert_id=%s for chat_id=%s (send queue saturated)",
+                            alert_id,
+                            r["user_id"]
+                        )
+                        continue
                     await mark_alert_triggered(alert_id)
 
         except asyncio.CancelledError:
@@ -2738,7 +2841,7 @@ async def snapshots_loop():
                 if incomplete:
                     log.warning("Partial snapshot uid=%s: prices %d/%d", uid, known, len(ids))
 
-                total_invested = 0.0
+                total_base_invested = 0.0
                 total_value = 0.0
                 for a in assets:
                     invested = float(a["invested_usd"])
@@ -2752,7 +2855,9 @@ async def snapshots_loop():
                         qty = 0.0
                     if qty == 0:
                         continue
-                    total_invested += invested
+
+                    base_invested = invested if invested > 0 else (qty * entry if entry > 0 else 0.0)
+                    total_base_invested += base_invested
 
                     cp = price_map.get(a["coingecko_id"])
                     if cp is not None:
@@ -2761,7 +2866,7 @@ async def snapshots_loop():
                 await insert_snapshot(
                     uid,
                     total_value=total_value,
-                    total_invested=total_invested,
+                    total_invested=total_base_invested,
                     incomplete=incomplete
                 )
         except asyncio.CancelledError:
