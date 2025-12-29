@@ -64,6 +64,7 @@ PRICE_POLL_SECONDS = int(os.getenv("PRICE_POLL_SECONDS", "60"))
 PRICE_TTL_SEC = int(os.getenv("PRICE_TTL_SEC", "180"))
 SNAPSHOT_EVERY_SECONDS = int(os.getenv("SNAPSHOT_EVERY_SECONDS", "14400"))
 SUMMARY_CACHE_TTL_SEC = int(os.getenv("SUMMARY_CACHE_TTL_SEC", str(PRICE_TTL_SEC)))
+SUMMARY_PAGE_CHAR_LIMIT = int(os.getenv("SUMMARY_PAGE_CHAR_LIMIT", "3900"))
 DEFAULT_ALERT_PRICE_CACHE = max(PRICE_POLL_SECONDS + 5, PRICE_TTL_SEC)
 ALERT_PRICE_CACHE_SEC = int(os.getenv("ALERT_PRICE_CACHE_SEC", str(DEFAULT_ALERT_PRICE_CACHE)))
 ALERT_RECENT_RESET_SECONDS = int(os.getenv("ALERT_RECENT_RESET_SECONDS", "3600"))
@@ -177,10 +178,10 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         resize_keyboard=True
     )
 
-def summary_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def summary_kb(page: int, total_pages: int) -> InlineKeyboardMarkup:
+    rows = [
         [
-            InlineKeyboardButton(text="🔄 Обновить", callback_data="summary:refresh"),
+            InlineKeyboardButton(text="🔄 Обновить", callback_data=f"summary:refresh:{page}"),
             InlineKeyboardButton(text="ℹ️ Почему не обновляется", callback_data="summary:info")
         ],
         [InlineKeyboardButton(text="➕ Добавить", callback_data="nav:add")],
@@ -188,7 +189,18 @@ def summary_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="✏️ Редактировать", callback_data="nav:edit"),
             InlineKeyboardButton(text="🗑 Удалить", callback_data="nav:delete")
         ]
-    ])
+    ]
+
+    if total_pages > 1:
+        prev_cb = f"summary:page:{page - 1}" if page > 0 else "summary:noop"
+        next_cb = f"summary:page:{page + 1}" if page + 1 < total_pages else "summary:noop"
+        rows.append([
+            InlineKeyboardButton(text="⬅️", callback_data=prev_cb),
+            InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="summary:noop"),
+            InlineKeyboardButton(text="➡️", callback_data=next_cb)
+        ])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def fmt_usd(x: float) -> str:
     return f"{x:,.2f}"
@@ -200,6 +212,36 @@ def fmt_qty(x: float) -> str:
     if abs(x) >= 1:
         return f"{x:,.6f}".rstrip("0").rstrip(".")
     return f"{x:.10f}".rstrip("0").rstrip(".")
+
+def paginate_text(text: str, limit: int = SUMMARY_PAGE_CHAR_LIMIT) -> List[str]:
+    """
+    Делит длинный текст на страницы не длиннее limit.
+    Сначала пробуем резать по двойному переводу строки, потом по одному,
+    иначе — жёстко по limit.
+    """
+    text = text or ""
+    if len(text) <= limit:
+        return [text]
+
+    parts: List[str] = []
+    rest = text
+    while len(rest) > limit:
+        split_pos = rest.rfind("\n\n", 0, limit)
+        if split_pos == -1:
+            split_pos = rest.rfind("\n", 0, limit)
+        if split_pos == -1 or split_pos == 0:
+            split_pos = limit
+        parts.append(rest[:split_pos].rstrip())
+        rest = rest[split_pos:].lstrip()
+    if rest:
+        parts.append(rest)
+    return [p for p in parts if p]
+
+def safe_symbol(sym: str) -> str:
+    return escape(sym or "")
+
+def safe_name(name: str) -> str:
+    return escape(name or "")
 
 def money_usd(x: float) -> str:
     return f"${fmt_usd(x)}"
@@ -933,6 +975,14 @@ async def get_summary_text(user_id: int, *, force_refresh: bool = False) -> str:
     await save_summary_cache(user_id, text)
     return text
 
+async def get_summary_pages(user_id: int, *, force_refresh: bool = False) -> List[str]:
+    """
+    Возвращает страницы сводки, разбитые по SUMMARY_PAGE_CHAR_LIMIT.
+    """
+    full_text = await get_summary_text(user_id, force_refresh=force_refresh)
+    pages = paginate_text(full_text, SUMMARY_PAGE_CHAR_LIMIT)
+    return pages or [full_text]
+
 async def send_digest(user_id: int, tz_name: Optional[str] = None) -> bool:
     text = await build_daily_digest_text(user_id, tz_name=tz_name)
     if not text:
@@ -1216,7 +1266,7 @@ def fmt_levels(entry: float, pcts: List[int], kind: str) -> str:
     return ", ".join(parts)
 
 def asset_card(comp: AssetComputed, risk_pcts: List[int], tp_pcts: List[int]) -> str:
-    title = f"🛠 {comp.symbol}" + (f" ({comp.name})" if comp.name else "")
+    title = f"🛠 {safe_symbol(comp.symbol)}" + (f" ({safe_name(comp.name)})" if comp.name else "")
     breakeven = comp.entry
 
     risk_line = fmt_levels(comp.entry, risk_pcts, "RISK")
@@ -1385,8 +1435,10 @@ async def build_summary_text(user_id: int, *, force_refresh: bool = False) -> st
     price_dt = datetime.fromtimestamp(price_ts, tz) if price_ts else datetime.now(tz)
     price_time_text = price_dt.strftime("%H:%M:%S")
 
-    known = sum(1 for cid in ids if cid in price_map)
-    total_assets = len(ids)
+    unique_total = len(ids)
+    unique_known = sum(1 for cid in ids if cid in price_map)
+    total_positions = len(assets)
+    known_positions = sum(1 for a in assets if a["coingecko_id"] in price_map)
 
     computed: List[AssetComputed] = []
     total_invested = 0.0
@@ -1451,12 +1503,16 @@ async def build_summary_text(user_id: int, *, force_refresh: bool = False) -> st
 
         blocks.append("\n".join(rows_block))
 
+    coverage_text = f"{known_positions}/{total_positions} поз."
+    if unique_total > 0:
+        coverage_text += f" • {unique_known}/{unique_total} мон."
+
     footer_lines: List[str] = [
-        ("⚠️ Цены: " if known != total_assets else "✅ Цены: ") + f"{known}/{total_assets}",
+        ("⚠️ Цены: " if known_positions != total_positions else "✅ Цены: ") + coverage_text,
         f"Вложено: {money_usd(total_invested)}",
     ]
 
-    if known != total_assets:
+    if known_positions != total_positions:
         footer_lines.append("Текущая стоимость: —")
         footer_lines.append("<b>ОБЩИЙ PNL: —</b>")
     else:
@@ -1738,8 +1794,10 @@ async def on_settings(m: Message, state: FSMContext):
 @router.message(F.text == "📊 Сводка")
 async def on_summary(m: Message):
     await upsert_user(m.from_user.id)
-    text = await get_summary_text(m.from_user.id)
-    msg = await m.answer(text, reply_markup=summary_kb())
+    pages = await get_summary_pages(m.from_user.id, force_refresh=False)
+    total_pages = len(pages)
+    page = 0
+    msg = await m.answer(pages[page], reply_markup=summary_kb(page, total_pages))
     await set_last_summary_message(m.from_user.id, m.chat.id, msg.message_id)
 
 @router.message(Command("reset"))
@@ -1777,9 +1835,15 @@ async def on_reset_no(cb: CallbackQuery, state: FSMContext):
     await cb.message.answer("Отменено. Меню:", reply_markup=main_menu_kb())
     await cb.answer("Отменено")
 
-@router.callback_query(F.data == "summary:refresh")
+@router.callback_query(F.data.startswith("summary:refresh"))
 async def on_summary_refresh(cb: CallbackQuery):
     await upsert_user(cb.from_user.id)
+
+    # извлекаем текущую страницу из callback, если есть
+    try:
+        page = int(cb.data.split(":")[2])
+    except Exception:
+        page = 0
 
     row = await db_fetchone(
         "SELECT last_summary_cached_at FROM users WHERE user_id=$1",
@@ -1792,24 +1856,54 @@ async def on_summary_refresh(cb: CallbackQuery):
     if use_cache:
         wait_left = int(SUMMARY_CACHE_TTL_SEC - (now - last_ts))
         await cb.answer(f"Показываю кэш. Новые цены через ~{max(wait_left, 0)} s")
-        text = await get_summary_text(cb.from_user.id, force_refresh=False)
+        pages = await get_summary_pages(cb.from_user.id, force_refresh=False)
     else:
         await cb.answer("Запрашиваю свежие цены CoinGecko…")
         t0 = time.perf_counter()
-        text = await get_summary_text(cb.from_user.id, force_refresh=True)
+        pages = await get_summary_pages(cb.from_user.id, force_refresh=True)
         log.info(
             "summary_refresh uid=%s took %.3fs (fresh)",
             cb.from_user.id,
             time.perf_counter() - t0
         )
 
+    total_pages = len(pages)
+    page = max(0, min(page, total_pages - 1))
+
     try:
-        await cb.message.edit_text(text, reply_markup=summary_kb())
+        await cb.message.edit_text(pages[page], reply_markup=summary_kb(page, total_pages))
     except TelegramBadRequest as e:
         if "message is not modified" in str(e):
             await cb.answer("У тебя уже самая свежая версия 👍")
             return
         raise
+
+@router.callback_query(F.data.startswith("summary:page:"))
+async def on_summary_page(cb: CallbackQuery):
+    await upsert_user(cb.from_user.id)
+    try:
+        page = int(cb.data.split("summary:page:", 1)[1])
+    except Exception:
+        return await cb.answer("Некорректная страница")
+
+    pages = await get_summary_pages(cb.from_user.id, force_refresh=False)
+    total_pages = len(pages)
+    if total_pages == 0:
+        return await cb.answer("Нет данных")
+
+    page = max(0, min(page, total_pages - 1))
+    try:
+        await cb.message.edit_text(pages[page], reply_markup=summary_kb(page, total_pages))
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await cb.answer("Уже тут 👍")
+            return
+        raise
+    await cb.answer()
+
+@router.callback_query(F.data == "summary:noop")
+async def on_summary_noop(cb: CallbackQuery):
+    await cb.answer()
 
 @router.callback_query(F.data == "nav:menu")
 async def on_nav_menu(cb: CallbackQuery, state: FSMContext):
@@ -1981,14 +2075,15 @@ async def on_edit_alerts_start(cb: CallbackQuery, state: FSMContext):
     await state.update_data(
         asset_id=asset_id,
         entry=float(a["entry_price"]),
-        selected_alerts=selected
+        selected_alerts=list(selected)
     )
     await state.set_state(EditAlertsFSM.alerts)
 
     sym = a["symbol"]
     entry = float(a["entry_price"])
+    ssym = safe_symbol(sym)
     msg = "\n".join([
-        f"Редактируем алерты для {sym}",
+        f"Редактируем алерты для {ssym}",
         f"Цена входа: {fmt_usd(entry)}",
         "",
         "Отметь уровни и нажми «💾 Готово»"
@@ -2026,13 +2121,15 @@ async def on_add_entry(m: Message, state: FSMContext):
             "PNL и алерты будут считаться от этой цены входа."
         )
 
-    await state.update_data(selected_alerts=set(), qty_override=None)
+    await state.update_data(selected_alerts=[], qty_override=None)
 
-    sym = data.get("symbol", "")
-    nm = data.get("name", "")
+    sym = (data.get("symbol") or "").upper()
+    nm = data.get("name") or ""
+    ssym = safe_symbol(sym)
+    sname = safe_name(nm)
 
     preview = "\n".join([
-        f"Ок, добавляем: {sym} ({nm})",
+        f"Ок, добавляем: {ssym} ({sname})",
         f"Сумма: {fmt_usd(invested)}",
         f"Цена входа: {fmt_usd(entry)}",
         "",
@@ -2057,12 +2154,15 @@ async def on_add_quantity(m: Message, state: FSMContext):
     entry = float(data.get("entry", 0.0))
     qty_override = float(qty)
 
-    await state.update_data(selected_alerts=set())
+    await state.update_data(selected_alerts=[])
+
+    ssym = safe_symbol(sym)
+    sname = safe_name(nm)
 
     note = "" if entry > 0 else "\n⚠️ Цена входа = 0, % алерты и PNL не будут посчитаны."
 
     preview = "\n".join([
-        f"Ок, добавляем: {sym} ({nm})",
+        f"Ок, добавляем: {ssym} ({sname})",
         f"Сумма: {fmt_usd(invested)}",
         f"Цена входа: {fmt_usd(entry)}",
         f"Количество: {fmt_qty(qty_override)}",
@@ -2077,11 +2177,11 @@ async def on_add_quantity(m: Message, state: FSMContext):
 async def on_add_alerts(cb: CallbackQuery, state: FSMContext):
     action = cb.data.split("add:alert:", 1)[1]
     data = await state.get_data()
-    selected: Set[str] = set(data.get("selected_alerts", set()))
+    selected: Set[str] = set(data.get("selected_alerts", []))
 
     if action == "none":
         selected = set()
-        await state.update_data(selected_alerts=selected)
+        await state.update_data(selected_alerts=list(selected))
         await cb.message.edit_reply_markup(reply_markup=alerts_kb(selected))
         return await cb.answer("Без алертов")
 
@@ -2135,7 +2235,7 @@ async def on_add_alerts(cb: CallbackQuery, state: FSMContext):
             selected.remove(action)
         else:
             selected.add(action)
-        await state.update_data(selected_alerts=selected)
+        await state.update_data(selected_alerts=list(selected))
         await cb.message.edit_reply_markup(reply_markup=alerts_kb(selected))
         return await cb.answer("Ок")
 
@@ -2145,13 +2245,13 @@ async def on_add_alerts(cb: CallbackQuery, state: FSMContext):
 async def on_edit_alerts(cb: CallbackQuery, state: FSMContext):
     action = cb.data.split("add:alert:", 1)[1]
     data = await state.get_data()
-    selected: Set[str] = set(data.get("selected_alerts", set()))
+    selected: Set[str] = set(data.get("selected_alerts", []))
     asset_id = int(data.get("asset_id"))
     entry = float(data.get("entry", 0.0))
 
     if action == "none":
         selected = set()
-        await state.update_data(selected_alerts=selected)
+        await state.update_data(selected_alerts=list(selected))
         await cb.message.edit_reply_markup(reply_markup=alerts_kb(selected))
         return await cb.answer("Без алертов")
 
@@ -2180,7 +2280,7 @@ async def on_edit_alerts(cb: CallbackQuery, state: FSMContext):
             selected.remove(action)
         else:
             selected.add(action)
-        await state.update_data(selected_alerts=selected)
+        await state.update_data(selected_alerts=list(selected))
         await cb.message.edit_reply_markup(reply_markup=alerts_kb(selected))
         return await cb.answer("Ок")
 
@@ -2211,7 +2311,7 @@ async def on_delete_asset(cb: CallbackQuery):
         return await cb.answer("Актив не найден")
 
     await delete_asset_row(cb.from_user.id, asset_id)
-    await cb.message.answer(f"Удалил {a['symbol']} ✅", reply_markup=main_menu_kb())
+    await cb.message.answer(f"Удалил {safe_symbol(a['symbol'])} ✅", reply_markup=main_menu_kb())
     await cb.answer("Удалено")
 
 # ------- edit -------
@@ -2257,16 +2357,17 @@ async def on_edit_delete_asset(cb: CallbackQuery, state: FSMContext):
     await delete_asset_row(cb.from_user.id, asset_id)
 
     assets = await list_assets(cb.from_user.id)
+    removed_sym = safe_symbol(a['symbol'])
     if not assets:
         await state.clear()
-        await cb.message.answer(f"Удалил {a['symbol']} ✅\nАктивов больше нет.", reply_markup=main_menu_kb())
+        await cb.message.answer(f"Удалил {removed_sym} ✅\nАктивов больше нет.", reply_markup=main_menu_kb())
         await cb.answer("Удалено")
         return
 
     await state.clear()
     await state.set_state(EditAssetFSM.choose_asset)
     await cb.message.answer(
-        f"Удалил {a['symbol']} ✅\n\nВыбери следующий актив:",
+        f"Удалил {removed_sym} ✅\n\nВыбери следующий актив:",
         reply_markup=assets_edit_list_kb(assets)
     )
     await cb.answer("Удалено")
@@ -2282,9 +2383,11 @@ async def on_edit_choose(cb: CallbackQuery, state: FSMContext):
 
     await state.update_data(asset_id=asset_id)
     await state.set_state(EditAssetFSM.invested)
+    ssym = safe_symbol(a['symbol'])
+    sname = safe_name(a['name'] or "")
     await cb.message.answer(
         "\n".join([
-            f"Редактируем {a['symbol']} ({a['name'] or ''})",
+            f"Редактируем {ssym} ({sname})",
             f"Текущая сумма: {fmt_usd(a['invested_usd'])}",
             f"Текущая цена входа: {fmt_usd(a['entry_price'])}",
             "",
