@@ -1255,17 +1255,36 @@ async def build_summary_text(user_id: int, *, force_refresh: bool = False) -> st
 
     price_map: Dict[str, float] = {}
     price_ts: Optional[float] = None
-    try:
-        price_map, missing, price_ts = await ensure_prices(
-            ids,
-            max_age=0 if force_refresh else PRICE_POLL_SECONDS,
-            direct_ttl=0 if force_refresh else PRICE_TTL_SEC,
-            need_timestamp=True
-        )
-        if missing:
-            log.warning("Summary: missing prices for %s", ", ".join(missing))
-    except Exception as e:
-        log.warning("Summary price fetch failed: %r", e)
+    attempts = 3 if force_refresh else 1
+    delay_between = 3.0
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(attempts):
+        try:
+            price_map, missing, price_ts = await ensure_prices(
+                ids,
+                max_age=0 if force_refresh else PRICE_POLL_SECONDS,
+                direct_ttl=0 if force_refresh else PRICE_TTL_SEC,
+                need_timestamp=True
+            )
+            if not missing:
+                break
+            log.warning(
+                "Summary: missing prices (%d ids) after ensure_prices attempt %d/%d",
+                len(missing), attempt + 1, attempts
+            )
+        except Exception as e:
+            last_exc = e
+            log.warning(
+                "Summary price fetch failed (attempt %d/%d): %r",
+                attempt + 1, attempts, e
+            )
+
+        if attempt + 1 < attempts:
+            await asyncio.sleep(delay_between)
+
+    if last_exc and not price_map:
+        raise last_exc
 
     price_dt = datetime.fromtimestamp(price_ts, tz) if price_ts else datetime.now(tz)
     price_time_text = price_dt.strftime("%H:%M:%S")
@@ -1561,7 +1580,7 @@ async def on_help(m: Message):
         "📚 <b>Что умеет бот</b>\n"
         "• /summary — мгновенно покажет лидера и аутсайдера портфеля\n"
         "• Кнопка «📊 Сводка» — полный отчёт по всем активам, алертам и PNL\n"
-        "• Алерты-«решётки»: цель автоматически сдвигается на тот же % после срабатывания\n"
+        "• Алерты: фиксированные уровни по выбранным %, срабатывают ровно на цели и переcобираются после выхода из коридора ±0.3%\n"
         "• Free-позиции: укажи цену входа и количество, PNL считается от базы entry × qty\n"
         "• /digest — ежедневный дайджест в 18:00 UTC (вкл/выкл)\n"
         "• /tz Region/City — смена часового пояса\n"
@@ -2311,6 +2330,8 @@ async def price_feed_loop():
             fetch_ts = time.time()
             for cid in batch:
                 price_direct_last_fetch[cid] = fetch_ts
+
+            await asyncio.sleep(10.0)  # разгружаем CoinGecko после успешного запроса
         except Exception as e:
             log.exception("price_feed_loop error: %r", e)
 
@@ -2400,8 +2421,8 @@ async def alerts_loop():
 
                 if not triggered:
                     should_fire = (
-                        (alert_type == "RISK" and cur <= lower_band) or
-                        (alert_type == "TP"   and cur >= upper_band)
+                        (alert_type == "RISK" and cur <= target) or
+                        (alert_type == "TP"   and cur >= target)
                     )
                     if not should_fire:
                         continue
@@ -2427,10 +2448,17 @@ async def alerts_loop():
                     icon = "🔴" if alert_type == "RISK" else "🟢"
                     verb = "снизилась" if alert_type == "RISK" else "выросла"
 
+                    if entry > 0:
+                        entry_delta_pct = (cur - entry) / entry * 100.0
+                        delta_line = f"Δ от входа: {sign_pct(entry_delta_pct)}"
+                    else:
+                        approx_delta = float(pct if alert_type == "TP" else -pct)
+                        delta_line = f"Δ от входа: {sign_pct(approx_delta)}"
+
                     text = "\n".join([
                         f"<b>🔔 АЛЕРТ: {escape(r['symbol'] or '')}</b>",
                         f"{icon} Цена {verb} на {pct}% (уровень {fmt_price(target)})",
-                        f"Δ от входа: {sign_pct(pct)}",
+                        delta_line,
                         f"Текущая цена: {fmt_price(cur)}",
                         f"{pnl_icon(pnl_usd)} PNL сейчас: {sign_money(pnl_usd)} ({pct_text})",
                     ])
