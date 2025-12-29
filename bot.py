@@ -66,6 +66,15 @@ SNAPSHOT_EVERY_SECONDS = int(os.getenv("SNAPSHOT_EVERY_SECONDS", "14400"))
 SUMMARY_CACHE_TTL_SEC = int(os.getenv("SUMMARY_CACHE_TTL_SEC", str(PRICE_TTL_SEC)))
 DEFAULT_ALERT_PRICE_CACHE = max(PRICE_POLL_SECONDS + 5, PRICE_TTL_SEC)
 ALERT_PRICE_CACHE_SEC = int(os.getenv("ALERT_PRICE_CACHE_SEC", str(DEFAULT_ALERT_PRICE_CACHE)))
+ALERT_RECENT_RESET_SECONDS = int(os.getenv("ALERT_RECENT_RESET_SECONDS", "3600"))
+PRICE_CACHE_MAX_AGE_SEC = int(os.getenv("PRICE_CACHE_MAX_AGE_SEC", "86400"))
+SEARCH_CACHE_MAX_AGE_SEC = int(os.getenv("SEARCH_CACHE_MAX_AGE_SEC", "86400"))
+SEARCH_CACHE_MAX_SIZE = int(os.getenv("SEARCH_CACHE_MAX_SIZE", "500"))
+LATEST_PRICE_MAX_AGE_SEC = int(os.getenv("LATEST_PRICE_MAX_AGE_SEC", str(max(PRICE_TTL_SEC * 10, 86400))))
+CACHE_CLEANUP_INTERVAL_SEC = int(os.getenv("CACHE_CLEANUP_INTERVAL_SEC", "900"))
+
+SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "500"))
+SEND_QUEUE_WORKERS = int(os.getenv("SEND_QUEUE_WORKERS", "2"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN. Put it into your .env (BOT_TOKEN=...)")
@@ -106,14 +115,23 @@ class SendTask:
     text: str
     kwargs: Dict[str, Any]
 
-send_queue: asyncio.Queue[SendTask] = asyncio.Queue()
+send_queue: asyncio.Queue[SendTask] = asyncio.Queue(maxsize=SEND_QUEUE_MAXSIZE)
 
 async def queue_text_message(chat_id: int, text: str, **kwargs):
+    if send_queue.full():
+        log.warning(
+            "Send queue is full (max=%d). Backpressure is building up.",
+            SEND_QUEUE_MAXSIZE
+        )
     await send_queue.put(SendTask(chat_id=chat_id, text=text, kwargs=kwargs))
 
-async def send_queue_worker(bot: Bot):
+async def send_queue_worker(bot: Bot, *, worker_id: int):
     while True:
-        task = await send_queue.get()
+        try:
+            task = await send_queue.get()
+        except asyncio.CancelledError:
+            break
+
         retries = 0
         while True:
             try:
@@ -121,18 +139,31 @@ async def send_queue_worker(bot: Bot):
                 break
             except TelegramRetryAfter as e:
                 delay = float(e.retry_after) + random.uniform(0.05, 0.3)
-                log.warning("RetryAfter %.2fs for chat_id=%s", delay, task.chat_id)
+                log.warning(
+                    "[send-%d] RetryAfter %.2fs for chat_id=%s",
+                    worker_id, delay, task.chat_id
+                )
                 await asyncio.sleep(delay)
             except TelegramBadRequest as e:
-                log.warning("Drop message to chat_id=%s: %s", task.chat_id, e)
+                log.warning(
+                    "[send-%d] Drop message to chat_id=%s: %s",
+                    worker_id, task.chat_id, e
+                )
                 break
+            except asyncio.CancelledError:
+                send_queue.task_done()
+                raise
             except Exception as e:
                 retries += 1
                 delay = min(30.0, 2 ** retries)
-                log.warning("Send failed (attempt=%s) chat_id=%s err=%r", retries, task.chat_id, e)
+                log.warning(
+                    "[send-%d] Send failed (attempt=%s) chat_id=%s err=%r",
+                    worker_id, retries, task.chat_id, e
+                )
                 await asyncio.sleep(delay)
                 if retries >= 5:
                     break
+
         send_queue.task_done()
 
 # ---------------------------- UI helpers ----------------------------
@@ -231,6 +262,9 @@ class CoinGeckoClient:
 
         # NEW: cache per-id (price)
         self._price_cache_id: Dict[str, Tuple[float, float]] = {}
+        self._price_cache_max_age = PRICE_CACHE_MAX_AGE_SEC
+        self._search_cache_max_age = SEARCH_CACHE_MAX_AGE_SEC
+        self._search_cache_max_size = SEARCH_CACHE_MAX_SIZE
 
         # NEW: cache for search(query)
         self._search_cache: Dict[str, Tuple[float, List[dict]]] = {}
@@ -289,6 +323,25 @@ class CoinGeckoClient:
 
         # не трогаем TTL кэша
         self._penalty_ttl_sec = 0
+
+    def purge_caches(self):
+        now = time.time()
+
+        cutoff_price = now - self._price_cache_max_age
+        stale_prices = [cid for cid, (ts, _) in self._price_cache_id.items() if ts < cutoff_price]
+        for cid in stale_prices:
+            self._price_cache_id.pop(cid, None)
+
+        cutoff_search = now - self._search_cache_max_age
+        stale_queries = [q for q, (ts, _) in self._search_cache.items() if ts < cutoff_search]
+        for q in stale_queries:
+            self._search_cache.pop(q, None)
+
+        excess = max(0, len(self._search_cache) - self._search_cache_max_size)
+        if excess > 0:
+            oldest = sorted(self._search_cache.items(), key=lambda item: item[1][0])[:excess]
+            for key, _ in oldest:
+                self._search_cache.pop(key, None)
 
     async def _rate_limit_wait(self):
         # simple global pacing between requests (+ adaptive penalty on 429)
@@ -557,6 +610,33 @@ async def ensure_prices(
 
     return price_map, missing, price_ts
 
+async def prune_internal_price_caches():
+    cutoff = time.time() - LATEST_PRICE_MAX_AGE_SEC
+
+    async with latest_prices_lock:
+        stale_latest = [cid for cid, (ts, _) in latest_prices.items() if ts < cutoff]
+        for cid in stale_latest:
+            latest_prices.pop(cid, None)
+
+    stale_direct = [cid for cid, ts in price_direct_last_fetch.items() if ts < cutoff]
+    for cid in stale_direct:
+        price_direct_last_fetch.pop(cid, None)
+
+async def cache_cleanup_loop():
+    while True:
+        try:
+            await prune_internal_price_caches()
+            cg.purge_caches()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.exception("cache_cleanup_loop error: %r", e)
+
+        try:
+            await asyncio.sleep(CACHE_CLEANUP_INTERVAL_SEC)
+        except asyncio.CancelledError:
+            break
+
 # ---------------------------- DB (Postgres / Neon) ----------------------------
 pg_pool: Optional[asyncpg.Pool] = None
 INSTANCE_LOCK_KEY = int(os.getenv("INSTANCE_LOCK_KEY", "912345678901234567"))
@@ -767,6 +847,7 @@ async def delete_all_user_data(user_id: int, delete_snapshots: bool = True):
     await db_exec("DELETE FROM assets WHERE user_id=$1", (user_id,))
     if delete_snapshots:
         await db_exec("DELETE FROM pnl_snapshots WHERE user_id=$1", (user_id,))
+    await invalidate_summary_cache(user_id)
     # users строку не трогаем — пусть остаются настройки/last_summary
 
 def reset_confirm_kb() -> InlineKeyboardMarkup:
@@ -793,6 +874,7 @@ async def get_user_tz_name(user_id: int) -> str:
 
 async def set_user_tz_name(user_id: int, tz_name: str):
     await db_exec("UPDATE users SET tz=$1 WHERE user_id=$2", (tz_name, user_id))
+    await invalidate_summary_cache(user_id)
 
 def resolve_tz(tz_name: str):
     try:
@@ -833,6 +915,13 @@ async def save_summary_cache(user_id: int, text: str):
     await db_exec(
         "UPDATE users SET last_summary_text=$1, last_summary_cached_at=$2 WHERE user_id=$3",
         (text, int(time.time()), user_id)
+    )
+
+
+async def invalidate_summary_cache(user_id: int):
+    await db_exec(
+        "UPDATE users SET last_summary_text=NULL, last_summary_cached_at=NULL WHERE user_id=$1",
+        (user_id,)
     )
 
 async def get_summary_text(user_id: int, *, force_refresh: bool = False) -> str:
@@ -945,6 +1034,7 @@ async def add_asset_row(user_id: int, symbol: str, coingecko_id: str, name: str,
     if not row or "id" not in row:
         raise RuntimeError("add_asset_row: INSERT succeeded but no id returned")
 
+    await invalidate_summary_cache(user_id)
     return int(row["id"])
 
 async def update_asset_row(user_id: int, asset_id: int,
@@ -955,10 +1045,11 @@ async def update_asset_row(user_id: int, asset_id: int,
         "WHERE user_id=$4 AND id=$5",
         (invested_usd, entry_price, qty_override, user_id, asset_id)
     )
+    await invalidate_summary_cache(user_id)
 
 async def delete_asset_row(user_id: int, asset_id: int):
-    # alerts удалятся сами из-за ON DELETE CASCADE, но оставим “явно” удаление assets
     await db_exec("DELETE FROM assets WHERE user_id=$1 AND id=$2", (user_id, asset_id))
+    await invalidate_summary_cache(user_id)
 
 async def replace_alerts(asset_id: int, alerts: List[Tuple[str, int, float]]):
     await db_exec("DELETE FROM alerts WHERE asset_id=$1", (asset_id,))
@@ -987,6 +1078,7 @@ async def recompute_alert_targets(asset_id: int, new_entry: float):
         await replace_alerts(asset_id, updated)
 
 async def pending_alerts_joined():
+    cutoff = int(time.time()) - ALERT_RECENT_RESET_SECONDS
     return await db_fetchall(
         """
         SELECT
@@ -996,7 +1088,11 @@ async def pending_alerts_joined():
           a.invested_usd, a.entry_price, a.qty_override
         FROM alerts al
         JOIN assets a ON a.id = al.asset_id
-        """
+        WHERE
+          al.triggered = 0
+          OR (al.triggered = 1 AND al.triggered_at >= $1)
+        """,
+        (cutoff,)
     )
 
 async def mark_alert_triggered(alert_id: int):
@@ -2028,6 +2124,7 @@ async def on_add_alerts(cb: CallbackQuery, state: FSMContext):
         if alert_rows:
             await replace_alerts(asset_id, alert_rows)
 
+        await invalidate_summary_cache(cb.from_user.id)
         await state.clear()
         await cb.message.answer("Готово ✅ Актив добавлен.", reply_markup=main_menu_kb())
         return await cb.answer("Сохранено")
@@ -2072,6 +2169,7 @@ async def on_edit_alerts(cb: CallbackQuery, state: FSMContext):
             alert_rows.append((t, pct, float(target)))
 
         await replace_alerts(asset_id, alert_rows)
+        await invalidate_summary_cache(cb.from_user.id)
         await state.clear()
         await cb.message.answer("Алерты обновлены ✅", reply_markup=main_menu_kb())
         return await cb.answer("Сохранено")
@@ -2331,11 +2429,15 @@ async def price_feed_loop():
             for cid in batch:
                 price_direct_last_fetch[cid] = fetch_ts
 
-            await asyncio.sleep(10.0)  # разгружаем CoinGecko после успешного запроса
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             log.exception("price_feed_loop error: %r", e)
 
-        await asyncio.sleep(PRICE_POLL_SECONDS)
+        try:
+            await asyncio.sleep(PRICE_POLL_SECONDS)
+        except asyncio.CancelledError:
+            break
 
 async def alerts_loop():
     while True:
@@ -2465,10 +2567,15 @@ async def alerts_loop():
                     await queue_text_message(int(r["user_id"]), text)
                     await mark_alert_triggered(alert_id)
 
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             log.exception("alerts_loop error: %r", e)
 
-        await asyncio.sleep(PRICE_POLL_SECONDS + random.uniform(0, 5))
+        try:
+            await asyncio.sleep(PRICE_POLL_SECONDS + random.uniform(0, 5))
+        except asyncio.CancelledError:
+            break
 
 async def snapshots_loop():
     while True:
@@ -2554,40 +2661,49 @@ async def snapshots_loop():
                     total_invested=total_invested,
                     incomplete=incomplete
                 )
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             log.exception("snapshots_loop error: %r", e)
 
-        await asyncio.sleep(SNAPSHOT_EVERY_SECONDS + random.uniform(0, 5))
+        try:
+            await asyncio.sleep(SNAPSHOT_EVERY_SECONDS + random.uniform(0, 5))
+        except asyncio.CancelledError:
+            break
 
 async def digest_loop():
     while True:
-        now = datetime.now(timezone.utc)
-        target = now.replace(hour=18, minute=0, second=0, microsecond=0)
-        if now >= target:
-            target += timedelta(days=1)
+        try:
+            now = datetime.now(timezone.utc)
+            target = now.replace(hour=18, minute=0, second=0, microsecond=0)
+            if now >= target:
+                target += timedelta(days=1)
 
-        sleep_for = max(0.0, (target - now).total_seconds())
-        await asyncio.sleep(sleep_for)
+            sleep_for = max(0.0, (target - now).total_seconds())
+            await asyncio.sleep(sleep_for)
 
-        date_key = target.year * 10000 + target.month * 100 + target.day
+            date_key = target.year * 10000 + target.month * 100 + target.day
 
-        while True:
-            try:
-                rows = await list_digest_enabled_users()
-                for row in rows:
-                    user_id = int(row["user_id"])
-                    tz_name = row.get("tz") or "UTC"
-                    last_sent = row.get("last_digest_sent_date")
-                    if last_sent == date_key:
-                        continue
-                    sent = await send_digest(user_id, tz_name=tz_name)
-                    if sent:
-                        await set_last_digest_sent_date(user_id, date_key)
-                break
-            except Exception as e:
-                log.exception("digest_loop error: %r", e)
-                await asyncio.sleep(60)
-
+            while True:
+                try:
+                    rows = await list_digest_enabled_users()
+                    for row in rows:
+                        user_id = int(row["user_id"])
+                        tz_name = row.get("tz") or "UTC"
+                        last_sent = row.get("last_digest_sent_date")
+                        if last_sent == date_key:
+                            continue
+                        sent = await send_digest(user_id, tz_name=tz_name)
+                        if sent:
+                            await set_last_digest_sent_date(user_id, date_key)
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log.exception("digest_loop error: %r", e)
+                    await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            break
 # ---------------------------- main ----------------------------
 async def main():
     await init_db()
@@ -2617,12 +2733,16 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    send_worker = asyncio.create_task(send_queue_worker(bot))
+    send_workers = [
+        asyncio.create_task(send_queue_worker(bot, worker_id=i + 1))
+        for i in range(SEND_QUEUE_WORKERS)
+    ]
     price_task = asyncio.create_task(price_feed_loop())
     alert_task = asyncio.create_task(alerts_loop())
     snap_task = asyncio.create_task(snapshots_loop())
     digest_task = asyncio.create_task(digest_loop())
-    tasks = (health_task, send_worker, price_task, alert_task, snap_task, digest_task)
+    cleanup_task = asyncio.create_task(cache_cleanup_loop())
+    tasks = (health_task, *send_workers, price_task, alert_task, snap_task, digest_task, cleanup_task)
 
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
