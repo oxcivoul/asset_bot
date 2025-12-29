@@ -84,6 +84,9 @@ CACHE_CLEANUP_INTERVAL_SEC = int(os.getenv("CACHE_CLEANUP_INTERVAL_SEC", "900"))
 SEND_QUEUE_MAXSIZE = int(os.getenv("SEND_QUEUE_MAXSIZE", "500"))
 SEND_QUEUE_WORKERS = int(os.getenv("SEND_QUEUE_WORKERS", "2"))
 SEND_QUEUE_PUT_TIMEOUT_SEC = float(os.getenv("SEND_QUEUE_PUT_TIMEOUT_SEC", "1.0"))
+ALERT_SEND_QUEUE_MAXSIZE = int(os.getenv("ALERT_SEND_QUEUE_MAXSIZE", "200"))
+DIGEST_RETRY_ATTEMPTS = int(os.getenv("DIGEST_RETRY_ATTEMPTS", "3"))
+DIGEST_RETRY_DELAY_SEC = float(os.getenv("DIGEST_RETRY_DELAY_SEC", "5.0"))
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN. Put it into your .env (BOT_TOKEN=...)")
@@ -125,55 +128,63 @@ class SendTask:
     kwargs: Dict[str, Any]
 
 send_queue: asyncio.Queue[SendTask] = asyncio.Queue(maxsize=SEND_QUEUE_MAXSIZE)
+alert_queue: asyncio.Queue[SendTask] = asyncio.Queue(maxsize=ALERT_SEND_QUEUE_MAXSIZE)
 
 async def queue_text_message(
     chat_id: int,
     text: str,
     *,
     timeout: Optional[float] = None,
+    urgent: bool = False,
     **kwargs
 ) -> bool:
     put_timeout = SEND_QUEUE_PUT_TIMEOUT_SEC if timeout is None else timeout
+    target_queue = alert_queue if urgent else send_queue
+    queue_label = "alert" if urgent else "default"
     task = SendTask(chat_id=chat_id, text=text, kwargs=kwargs)
 
     if put_timeout is not None and put_timeout <= 0:
         try:
-            send_queue.put_nowait(task)
+            target_queue.put_nowait(task)
             return True
         except asyncio.QueueFull:
             log.error(
-                "Send queue saturated (size=%d/%d). Drop chat_id=%s",
-                send_queue.qsize(),
-                SEND_QUEUE_MAXSIZE,
+                "%s send queue saturated (size=%d/%d). Drop chat_id=%s",
+                queue_label.capitalize(),
+                target_queue.qsize(),
+                target_queue.maxsize,
                 chat_id
             )
             return False
 
     try:
         if put_timeout is None:
-            await send_queue.put(task)
+            await target_queue.put(task)
         else:
-            await asyncio.wait_for(send_queue.put(task), timeout=put_timeout)
-        if send_queue.full():
+            await asyncio.wait_for(target_queue.put(task), timeout=put_timeout)
+        if target_queue.full():
             log.warning(
-                "Send queue is full (size=%d/%d). Producers may back off.",
-                send_queue.qsize(),
-                SEND_QUEUE_MAXSIZE
+                "%s send queue is full (size=%d/%d). Producers may back off.",
+                queue_label.capitalize(),
+                target_queue.qsize(),
+                target_queue.maxsize
             )
         return True
     except asyncio.TimeoutError:
         log.error(
-            "Send queue put timeout after %.2fs (size=%d/%d). Drop chat_id=%s",
+            "%s send queue put timeout after %.2fs (size=%d/%d). Drop chat_id=%s",
+            queue_label.capitalize(),
             put_timeout,
-            send_queue.qsize(),
-            SEND_QUEUE_MAXSIZE,
+            target_queue.qsize(),
+            target_queue.maxsize,
             chat_id
         )
     except asyncio.QueueFull:
         log.error(
-            "Send queue saturated (size=%d/%d). Drop chat_id=%s",
-            send_queue.qsize(),
-            SEND_QUEUE_MAXSIZE,
+            "%s send queue saturated (size=%d/%d). Drop chat_id=%s",
+            queue_label.capitalize(),
+            target_queue.qsize(),
+            target_queue.maxsize,
             chat_id
         )
     return False
@@ -181,7 +192,12 @@ async def queue_text_message(
 async def send_queue_worker(bot: Bot, *, worker_id: int):
     while True:
         try:
-            task = await send_queue.get()
+            try:
+                task = await asyncio.wait_for(alert_queue.get(), timeout=0.1)
+                source_queue = alert_queue
+            except asyncio.TimeoutError:
+                task = await send_queue.get()
+                source_queue = send_queue
         except asyncio.CancelledError:
             break
 
@@ -213,7 +229,8 @@ async def send_queue_worker(bot: Bot, *, worker_id: int):
                 )
                 break
             except asyncio.CancelledError:
-                send_queue.task_done()
+                if source_queue is not None:
+                    source_queue.task_done()
                 raise
             except Exception as e:
                 retries += 1
@@ -226,7 +243,7 @@ async def send_queue_worker(bot: Bot, *, worker_id: int):
                 if retries >= 5:
                     break
 
-        send_queue.task_done()
+        source_queue.task_done()
 
 # ---------------------------- UI helpers ----------------------------
 def main_menu_kb() -> ReplyKeyboardMarkup:
@@ -435,8 +452,9 @@ class CoinGeckoClient:
         self._stats_time = 0.0
         self._stats_429 = 0
 
-        # NEW: serialize actual HTTP calls too (prevents parallel in-flight requests)
-        self._net_lock = asyncio.Lock()
+        # NEW: ограничиваем параллельность HTTP (но не «затыкаем» её в 1 поток)
+        self._max_parallel_http = max(1, int(os.getenv("COINGECKO_MAX_PARALLEL", "3")))
+        self._net_sem = asyncio.Semaphore(self._max_parallel_http)
 
         self._api_key = os.getenv("COINGECKO_API_KEY", "").strip()
         self._headers = {
@@ -514,12 +532,12 @@ class CoinGeckoClient:
                 self._penalty_ttl_sec = int(self._penalty_ttl_sec * 0.9)
 
     async def _get_json(self, path: str, params: Dict[str, str], *, tries: int = 5) -> dict:
-        async with self._net_lock:
-            url = f"{self.BASE}{path}"
-            backoff = 1.0
-            last_exc: Optional[BaseException] = None
+        url = f"{self.BASE}{path}"
+        backoff = 1.0
+        last_exc: Optional[BaseException] = None
 
-            for attempt in range(1, tries + 1):
+        for attempt in range(1, tries + 1):
+            async with self._net_sem:
                 try:
                     t0 = time.perf_counter()
                     s = await self.session()
@@ -596,7 +614,7 @@ class CoinGeckoClient:
                     await asyncio.sleep(backoff + random.random() * 0.25)
                     backoff = min(backoff * 2.0, 30.0)
 
-            raise last_exc or RuntimeError("CoinGecko request failed")
+        raise last_exc or RuntimeError("CoinGecko request failed")
 
     async def search(self, query: str, ttl_sec: int = 600) -> List[dict]:
         q = (query or "").strip().lower()
@@ -912,29 +930,35 @@ async def init_db():
 
 async def acquire_instance_lock() -> bool:
     """
-    Берём pg_try_advisory_lock на выделенном соединении.
-    Если lock не взят — это значит, что другой инстанс уже работает.
+    Берём pg_try_advisory_lock на отдельном соединении (вне пула),
+    чтобы не «захоранивать» слот pg_pool навсегда.
     """
     global instance_lock_conn
-    assert pg_pool is not None
-
-    # если вдруг уже брали — считаем ок
     if instance_lock_conn is not None:
         return True
 
-    conn = await pg_pool.acquire()
+    try:
+        conn = await asyncpg.connect(
+            dsn=DATABASE_URL,
+            timeout=30,
+            statement_cache_size=0
+        )
+    except Exception:
+        log.exception("acquire_instance_lock: failed to open dedicated connection")
+        return False
+
     try:
         row = await conn.fetchrow("SELECT pg_try_advisory_lock($1) AS ok", INSTANCE_LOCK_KEY)
-        ok = bool(row["ok"])
+        ok = bool(row and row.get("ok"))
         if ok:
-            # ВАЖНО: не release() — держим соединение живым, иначе lock пропадёт
             instance_lock_conn = conn
             log.info("Instance lock acquired (key=%s)", INSTANCE_LOCK_KEY)
             return True
+    except Exception:
+        log.exception("acquire_instance_lock: failed to obtain advisory lock")
     finally:
-        # lock не взяли — возвращаем соединение в пул
         if instance_lock_conn is None:
-            await pg_pool.release(conn)
+            await conn.close()
 
     log.warning("Instance lock NOT acquired (key=%s). Another instance is running.", INSTANCE_LOCK_KEY)
     return False
@@ -942,17 +966,16 @@ async def acquire_instance_lock() -> bool:
 
 async def release_instance_lock():
     global instance_lock_conn
-    if instance_lock_conn is None or pg_pool is None:
+    if instance_lock_conn is None:
         return
 
     try:
         await instance_lock_conn.execute("SELECT pg_advisory_unlock($1)", INSTANCE_LOCK_KEY)
     except Exception:
-        # даже если unlock упал, при закрытии соединения lock всё равно уйдёт
         pass
 
     try:
-        await pg_pool.release(instance_lock_conn)
+        await instance_lock_conn.close()
     except Exception:
         pass
 
@@ -2915,7 +2938,6 @@ async def alerts_loop():
                         triggered = False
                     else:
                         continue
-
                 if not triggered:
                     should_fire = (
                         (alert_type == "RISK" and cur <= target) or
@@ -2939,7 +2961,7 @@ async def alerts_loop():
 
                     base_invested = invested if invested > 0 else qty * entry
                     pnl_usd = qty * cur - base_invested
-                    pnl_pct = None if base_invested == 0 else pnl_usd / base_invested * 100.0
+                    pnl_pct = None if base_invested == 0 else pnl_usд / base_invested * 100.0
                     pct_text = "—" if pnl_pct is None else sign_pct(pnl_pct)
 
                     icon = "🔴" if alert_type == "RISK" else "🟢"
@@ -2959,7 +2981,7 @@ async def alerts_loop():
                         f"Текущая цена: {fmt_price(cur)}",
                         f"{pnl_icon(pnl_usd)} PNL сейчас: {sign_money(pnl_usd)} ({pct_text})",
                     ])
-                    queued = await queue_text_message(int(r["user_id"]), text)
+                    queued = await queue_text_message(int(r["user_id"]), text, urgent=True)
                     if not queued:
                         log.error(
                             "alerts_loop: drop alert_id=%s for chat_id=%s (send queue saturated)",
@@ -3091,15 +3113,48 @@ async def digest_loop():
             while True:
                 try:
                     rows = await list_digest_enabled_users()
+                    pending: List[dict] = []
                     for row in rows:
-                        user_id = int(row["user_id"])
-                        tz_name = row.get("tz") or "UTC"
-                        last_sent = row.get("last_digest_sent_date")
-                        if last_sent == date_key:
+                        if row.get("last_digest_sent_date") == date_key:
                             continue
-                        sent = await send_digest(user_id, tz_name=tz_name)
-                        if sent:
-                            await set_last_digest_sent_date(user_id, date_key)
+                        pending.append(row)
+
+                    if not pending:
+                        break
+
+                    attempt = 1
+                    while pending:
+                        next_pending: List[dict] = []
+                        for row in pending:
+                            user_id = int(row["user_id"])
+                            tz_name = row.get("tz") or "UTC"
+                            sent = await send_digest(user_id, tz_name=tz_name)
+                            if sent:
+                                await set_last_digest_sent_date(user_id, date_key)
+                            else:
+                                next_pending.append(row)
+                                log.warning(
+                                    "digest_loop: attempt %d/%d queue saturated for chat_id=%s",
+                                    attempt,
+                                    DIGEST_RETRY_ATTEMPTS,
+                                    user_id
+                                )
+
+                        if not next_pending:
+                            break
+
+                        if attempt >= DIGEST_RETRY_ATTEMPTS:
+                            log.error(
+                                "digest_loop: final drop after %d retries, chat_ids=%s",
+                                DIGEST_RETRY_ATTEMPTS,
+                                ", ".join(str(int(r["user_id"])) for r in next_pending)
+                            )
+                            break
+
+                        await asyncio.sleep(DIGEST_RETRY_DELAY_SEC)
+                        pending = next_pending
+                        attempt += 1
+
                     break
                 except asyncio.CancelledError:
                     raise
