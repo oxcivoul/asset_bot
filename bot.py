@@ -1012,11 +1012,17 @@ def reset_confirm_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="❌ Отмена", callback_data="reset:no")],
     ])
 
-async def upsert_user(user_id: int):
+async def upsert_user(user_id: int, *, auto_unmute: bool = True):
     await db_exec(
         "INSERT INTO users(user_id) VALUES ($1) ON CONFLICT(user_id) DO NOTHING",
         (user_id,)
     )
+
+    if auto_unmute:
+        await db_exec(
+            "UPDATE users SET muted=FALSE WHERE user_id=$1 AND muted",
+            (user_id,)
+        )
 
 async def set_last_summary_message(user_id: int, chat_id: int, message_id: int):
     await db_exec(
@@ -2897,7 +2903,13 @@ async def alerts_loop():
                 upper_band = target * (1 + ALERT_REARM_FACTOR)
 
                 if triggered:
-                    should_release = (cur <= lower_band) or (cur >= upper_band)
+                    if alert_type == "RISK":
+                        should_release = cur >= upper_band
+                    elif alert_type == "TP":
+                        should_release = cur <= lower_band
+                    else:
+                        should_release = (cur <= lower_band) or (cur >= upper_band)
+
                     if should_release:
                         await reset_alert_triggered(alert_id)
                         triggered = False
