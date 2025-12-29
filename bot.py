@@ -24,7 +24,13 @@ from aiogram.types import (
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramRetryAfter,
+    TelegramForbiddenError,
+    TelegramNotFound,
+    TelegramUnauthorizedError,
+)
 from aiogram.types import BufferedInputFile
 
 from datetime import datetime, timezone, timedelta
@@ -65,6 +71,7 @@ PRICE_TTL_SEC = int(os.getenv("PRICE_TTL_SEC", "180"))
 SNAPSHOT_EVERY_SECONDS = int(os.getenv("SNAPSHOT_EVERY_SECONDS", "14400"))
 SUMMARY_CACHE_TTL_SEC = int(os.getenv("SUMMARY_CACHE_TTL_SEC", str(PRICE_TTL_SEC)))
 SUMMARY_PAGE_CHAR_LIMIT = int(os.getenv("SUMMARY_PAGE_CHAR_LIMIT", "3900"))
+ASSET_LIST_PAGE_SIZE = int(os.getenv("ASSET_LIST_PAGE_SIZE", "10"))
 DEFAULT_ALERT_PRICE_CACHE = max(PRICE_POLL_SECONDS + 5, PRICE_TTL_SEC)
 ALERT_PRICE_CACHE_SEC = int(os.getenv("ALERT_PRICE_CACHE_SEC", str(DEFAULT_ALERT_PRICE_CACHE)))
 ALERT_RECENT_RESET_SECONDS = int(os.getenv("ALERT_RECENT_RESET_SECONDS", "3600"))
@@ -190,6 +197,15 @@ async def send_queue_worker(bot: Bot, *, worker_id: int):
                     worker_id, delay, task.chat_id
                 )
                 await asyncio.sleep(delay)
+            except (TelegramForbiddenError, TelegramNotFound, TelegramUnauthorizedError) as e:
+                log.warning(
+                    "[send-%d] Permanent failure chat_id=%s (%s). Muting user.",
+                    worker_id,
+                    task.chat_id,
+                    e.__class__.__name__
+                )
+                await mute_user(task.chat_id, reason=e.__class__.__name__)
+                break
             except TelegramBadRequest as e:
                 log.warning(
                     "[send-%d] Drop message to chat_id=%s: %s",
@@ -258,17 +274,39 @@ def fmt_qty(x: float) -> str:
         return f"{x:,.6f}".rstrip("0").rstrip(".")
     return f"{x:.10f}".rstrip("0").rstrip(".")
 
+def _split_html_block(chunk: str, limit: int) -> List[str]:
+    block = (chunk or "").strip()
+    if not block:
+        return []
+    if len(block) <= limit:
+        return [block]
+
+    result: List[str] = []
+    rest = block
+    while len(rest) > limit:
+        split_pos = rest.rfind("\n\n", 0, limit)
+        if split_pos == -1:
+            split_pos = rest.rfind("\n", 0, limit)
+        if split_pos == -1 or split_pos < int(limit * 0.6):
+            split_pos = limit
+        result.append(rest[:split_pos].rstrip())
+        rest = rest[split_pos:].lstrip()
+    if rest:
+        result.append(rest)
+    return result
+
+
 def paginate_text(text: str, limit: int = SUMMARY_PAGE_CHAR_LIMIT) -> List[str]:
     """
     Делит длинный текст на страницы не длиннее limit.
     Сначала пробуем резать по двойному переводу строки, потом по одному,
-    иначе — жёстко по limit.
+    иначе — жёстко по limit (уже после HTML-экранирования).
     """
     text = text or ""
-    if len(text) <= limit:
-        return [text]
+    if not text:
+        return [""]
 
-    parts: List[str] = []
+    rough_parts: List[str] = []
     rest = text
     while len(rest) > limit:
         split_pos = rest.rfind("\n\n", 0, limit)
@@ -276,11 +314,36 @@ def paginate_text(text: str, limit: int = SUMMARY_PAGE_CHAR_LIMIT) -> List[str]:
             split_pos = rest.rfind("\n", 0, limit)
         if split_pos == -1 or split_pos == 0:
             split_pos = limit
-        parts.append(rest[:split_pos].rstrip())
+        rough_parts.append(rest[:split_pos].rstrip())
         rest = rest[split_pos:].lstrip()
     if rest:
-        parts.append(rest)
-    return [p for p in parts if p]
+        rough_parts.append(rest)
+
+    pages: List[str] = []
+    for part in rough_parts:
+        pages.extend(_split_html_block(part, limit))
+
+    pages = [p for p in pages if p]
+    return pages or [""]
+
+def prepend_warning_to_pages(
+    pages: List[str],
+    warning: str,
+    limit: int = SUMMARY_PAGE_CHAR_LIMIT
+) -> List[str]:
+    if not warning:
+        return pages
+
+    if not pages:
+        updated = [warning]
+    else:
+        updated = [f"{warning}\n\n{pages[0]}"] + pages[1:]
+
+    safe_pages: List[str] = []
+    for chunk in updated:
+        safe_pages.extend(_split_html_block(chunk, limit))
+
+    return safe_pages or [warning]
 
 def safe_symbol(sym: str) -> str:
     return escape(sym or "")
@@ -684,7 +747,7 @@ async def ensure_prices(
         price_map.update(fresh_map)
 
         fetch_ts = fresh_ts or time.time()
-        for cid in to_fetch:
+        for cid in fresh_map:
             price_direct_last_fetch[cid] = fetch_ts
 
         if need_timestamp:
@@ -819,6 +882,12 @@ async def init_db():
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS digest_enabled BOOLEAN NOT NULL DEFAULT FALSE;")
         except Exception:
             log.exception("Migration failed: ALTER TABLE users ADD COLUMN digest_enabled")
+            raise
+
+        try:
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS muted BOOLEAN NOT NULL DEFAULT FALSE;")
+        except Exception:
+            log.exception("Migration failed: ALTER TABLE users ADD COLUMN muted")
             raise
 
         try:
@@ -971,6 +1040,23 @@ def resolve_tz(tz_name: str):
 
 async def set_digest_enabled(user_id: int, enabled: bool):
     await db_exec("UPDATE users SET digest_enabled=$1 WHERE user_id=$2", (enabled, user_id))
+
+async def mute_user(user_id: int, *, reason: str):
+    row = await db_fetchone("SELECT muted FROM users WHERE user_id=$1", (user_id,))
+    if not row:
+        log.warning("mute_user: user_id=%s missing in DB (reason=%s)", user_id, reason)
+        return
+    if row.get("muted"):
+        return
+    await db_exec(
+        "UPDATE users SET muted=TRUE, digest_enabled=FALSE WHERE user_id=$1",
+        (user_id,)
+    )
+    log.warning(
+        "Muted user_id=%s due to %s. Digest disabled, alerts silenced.",
+        user_id,
+        reason
+    )
 
 async def get_digest_enabled(user_id: int) -> bool:
     row = await db_fetchone("SELECT digest_enabled FROM users WHERE user_id=$1", (user_id,))
@@ -1208,6 +1294,8 @@ async def pending_alerts_joined():
           a.invested_usd, a.entry_price, a.qty_override
         FROM alerts al
         JOIN assets a ON a.id = al.asset_id
+        JOIN users u ON u.user_id = a.user_id
+        WHERE NOT u.muted
         """
     )
 
@@ -1226,7 +1314,7 @@ async def all_users() -> List[int]:
 
 async def list_digest_enabled_users():
     return await db_fetchall(
-        "SELECT user_id, tz, last_digest_sent_date FROM users WHERE digest_enabled"
+        "SELECT user_id, tz, last_digest_sent_date FROM users WHERE digest_enabled AND NOT muted"
     )
 
 async def insert_snapshot(user_id: int, total_value: float, total_invested: float, *, incomplete: bool):
@@ -1765,19 +1853,45 @@ def alerts_kb(selected: Set[str]) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="flow:cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def assets_list_kb(assets_rows, prefix: str) -> InlineKeyboardMarkup:
-    kb = []
-    for a in assets_rows:
+def assets_list_kb(assets_rows, prefix: str, page: int = 0) -> InlineKeyboardMarkup:
+    page_size = ASSET_LIST_PAGE_SIZE
+    total = len(assets_rows)
+    total_pages = max(1, math.ceil(total / page_size)) if total else 1
+    page = max(0, min(page, total_pages - 1))
+    start = page * page_size
+    end = start + page_size
+    visible = assets_rows[start:end]
+
+    kb: List[List[InlineKeyboardButton]] = []
+    for a in visible:
         kb.append([InlineKeyboardButton(
             text=f"{a['symbol']} — {fmt_usd(a['invested_usd'])} @ {fmt_usd(a['entry_price'])}",
             callback_data=f"{prefix}:asset:{a['id']}"
         )])
+
+    if total_pages > 1:
+        prev_cb = f"{prefix}:page:{page - 1}" if page > 0 else f"{prefix}:noop"
+        next_cb = f"{prefix}:page:{page + 1}" if page + 1 < total_pages else f"{prefix}:noop"
+        kb.append([
+            InlineKeyboardButton(text="⬅️", callback_data=prev_cb),
+            InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data=f"{prefix}:noop"),
+            InlineKeyboardButton(text="➡️", callback_data=next_cb),
+        ])
+
     kb.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="nav:menu")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-def assets_edit_list_kb(assets_rows) -> InlineKeyboardMarkup:
-    kb = []
-    for a in assets_rows:
+def assets_edit_list_kb(assets_rows, *, page: int = 0) -> InlineKeyboardMarkup:
+    page_size = ASSET_LIST_PAGE_SIZE
+    total = len(assets_rows)
+    total_pages = max(1, math.ceil(total / page_size)) if total else 1
+    page = max(0, min(page, total_pages - 1))
+    start = page * page_size
+    end = start + page_size
+    visible = assets_rows[start:end]
+
+    kb: List[List[InlineKeyboardButton]] = []
+    for a in visible:
         kb.append([
             InlineKeyboardButton(
                 text=f"✏️ {a['symbol']} — {fmt_usd(a['invested_usd'])} @ {fmt_usd(a['entry_price'])}",
@@ -1792,6 +1906,17 @@ def assets_edit_list_kb(assets_rows) -> InlineKeyboardMarkup:
                 callback_data=f"edit:delete:{a['id']}"
             )
         ])
+
+    if total_pages > 1:
+        prefix = "editlist"
+        prev_cb = f"{prefix}:page:{page - 1}" if page > 0 else f"{prefix}:noop"
+        next_cb = f"{prefix}:page:{page + 1}" if page + 1 < total_pages else f"{prefix}:noop"
+        kb.append([
+            InlineKeyboardButton(text="⬅️", callback_data=prev_cb),
+            InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data=f"{prefix}:noop"),
+            InlineKeyboardButton(text="➡️", callback_data=next_cb),
+        ])
+
     kb.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="nav:menu")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
@@ -1887,7 +2012,7 @@ async def on_summary(m: Message):
         await m.answer(warning or "⚠️ CoinGecko недоступен. Попробуй позже.")
         return
     if warning:
-        pages[0] = f"{warning}\n\n{pages[0]}"
+        pages = prepend_warning_to_pages(pages, warning)
     total_pages = len(pages)
     page = 0
     msg = await m.answer(pages[page], reply_markup=summary_kb(page, total_pages))
@@ -1956,10 +2081,11 @@ async def on_summary_refresh(cb: CallbackQuery):
         await cb.message.answer(warning or "⚠️ CoinGecko недоступен. Попробуй позже.")
         return
 
+    if warning:
+        pages = prepend_warning_to_pages(pages, warning)
+
     total_pages = len(pages)
     page = max(0, min(page, total_pages - 1))
-    if warning:
-        pages[page] = f"{warning}\n\n{pages[page]}"
 
     try:
         await cb.message.edit_text(pages[page], reply_markup=summary_kb(page, total_pages))
@@ -1983,13 +2109,14 @@ async def on_summary_page(cb: CallbackQuery):
         await cb.answer("Ошибка")
         return
 
+    if warning:
+        pages = prepend_warning_to_pages(pages, warning)
+
     total_pages = len(pages)
     if total_pages == 0:
         return await cb.answer("Нет данных")
 
     page = max(0, min(page, total_pages - 1))
-    if warning:
-        pages[page] = f"{warning}\n\n{pages[page]}"
 
     try:
         await cb.message.edit_text(pages[page], reply_markup=summary_kb(page, total_pages))
@@ -2402,6 +2529,28 @@ async def on_delete_menu_cb(cb: CallbackQuery):
     await cb.message.answer("Выбери актив для удаления:", reply_markup=assets_list_kb(assets, "del"))
     await cb.answer()
 
+@router.callback_query(F.data.startswith("del:page:"))
+async def on_delete_page(cb: CallbackQuery):
+    try:
+        page = int(cb.data.split("del:page:", 1)[1])
+    except ValueError:
+        await cb.answer("Страница недоступна")
+        return
+
+    assets = await list_assets(cb.from_user.id)
+    if not assets:
+        await cb.message.edit_text("Активов пока нет — удалять нечего.", reply_markup=main_menu_kb())
+        await cb.answer("Портфель пуст")
+        return
+
+    kb = assets_list_kb(assets, "del", page=page)
+    await cb.message.edit_text("Выбери актив для удаления:", reply_markup=kb)
+    await cb.answer()
+
+@router.callback_query(F.data == "del:noop")
+async def on_delete_noop(cb: CallbackQuery):
+    await cb.answer("Это крайняя страница")
+
 @router.callback_query(F.data.startswith("del:asset:"))
 async def on_delete_asset(cb: CallbackQuery):
     asset_id = int(cb.data.split("del:asset:", 1)[1])
@@ -2441,6 +2590,33 @@ async def on_edit_menu_cb(cb: CallbackQuery, state: FSMContext):
         reply_markup=assets_edit_list_kb(assets)
     )
     await cb.answer()
+
+@router.callback_query(F.data.startswith("editlist:page:"))
+async def on_edit_list_page(cb: CallbackQuery, state: FSMContext):
+    try:
+        page = int(cb.data.split("editlist:page:", 1)[1])
+    except ValueError:
+        await cb.answer("Страница недоступна")
+        return
+
+    assets = await list_assets(cb.from_user.id)
+    if not assets:
+        await state.clear()
+        await cb.message.edit_text("Активов пока нет — редактировать нечего.", reply_markup=main_menu_kb())
+        await cb.answer("Портфель пуст")
+        return
+
+    await state.set_state(EditAssetFSM.choose_asset)
+    text = (
+        "Выбери актив:\n"
+        "✏️ — редактировать, 🗑 — удалить"
+    )
+    await cb.message.edit_text(text, reply_markup=assets_edit_list_kb(assets, page=page))
+    await cb.answer()
+
+@router.callback_query(F.data == "editlist:noop")
+async def on_edit_list_noop(cb: CallbackQuery):
+    await cb.answer("Это крайняя страница")
 
 @router.callback_query(F.data.startswith("edit:delete:"))
 async def on_edit_delete_asset(cb: CallbackQuery, state: FSMContext):
@@ -2628,8 +2804,16 @@ async def price_feed_loop():
             await price_feed_store(fresh)
 
             fetch_ts = time.time()
-            for cid in batch:
+            for cid in fresh:
                 price_direct_last_fetch[cid] = fetch_ts
+
+            if len(fresh) != len(batch):
+                missing_ids = [cid for cid in batch if cid not in fresh]
+                log.debug(
+                    "price_feed_loop: CoinGecko skipped %d ids: %s",
+                    len(missing_ids),
+                    ", ".join(missing_ids)
+                )
 
         except asyncio.CancelledError:
             break
@@ -2681,7 +2865,7 @@ async def alerts_loop():
                     price_map.update(fresh)
 
                     fetch_ts = time.time()
-                    for cid in to_fetch:
+                    for cid in fresh:
                         price_direct_last_fetch[cid] = fetch_ts
 
                     missing = [cid for cid in missing if cid not in fresh]
@@ -2820,7 +3004,7 @@ async def snapshots_loop():
                         price_map.update(fresh)
 
                         fetch_ts = time.time()
-                        for cid in to_fetch:
+                        for cid in fresh:
                             price_direct_last_fetch[cid] = fetch_ts
 
                         missing = [cid for cid in missing if cid not in fresh]
