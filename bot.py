@@ -2172,12 +2172,12 @@ async def on_add_mode(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "info:free")
 async def on_info_free(cb: CallbackQuery):
-    await cb.answer()  # закрыть спиннер
-    await cb.message.answer(
+    await cb.answer(
         "Как считать free-позиции:\n"
         "1) Укажи цену входа (>0) — по ней считаются база и алерты.\n"
         "2) Укажи количество монет — по нему считается стоимость и PNL.\n"
-        "PNL идёт от базы (entry * qty), даже если вложено = 0."
+        "PNL идёт от базы (entry * qty), даже если вложено = 0.",
+        show_alert=True
     )
 
 @router.callback_query(F.data.startswith("edit:alerts:"))
@@ -2333,12 +2333,15 @@ async def on_add_alerts(cb: CallbackQuery, state: FSMContext):
     action = cb.data.split("add:alert:", 1)[1]
     data = await state.get_data()
     selected: Set[str] = set(data.get("selected_alerts", []))
+    force_finish = False
 
     if action == "none":
         selected = set()
         await state.update_data(selected_alerts=list(selected))
-        await cb.message.edit_reply_markup(reply_markup=alerts_kb(selected))
-        return await cb.answer("Без алертов")
+        force_finish = True
+
+    if force_finish:
+        action = "done"
 
     if action == "done":
         data = await state.get_data()
@@ -2383,9 +2386,10 @@ async def on_add_alerts(cb: CallbackQuery, state: FSMContext):
         await drop_last_prompt(state, cb.bot)
         await state.clear()
         await safe_delete(cb.message)
-        await cb.message.answer("Готово ✅ Актив добавлен.", reply_markup=main_menu_kb())
-        return await cb.answer("Сохранено")
-    # toggle
+
+        toast = "Актив добавлен без алертов ✅" if force_finish else "Актив добавлен ✅"
+        return await cb.answer(toast, show_alert=True)
+
     allowed = {f"RISK:{p}" for p in RISK_LEVELS} | {f"TP:{p}" for p in TP_LEVELS}
     if action in allowed:
         if action in selected:
@@ -2405,20 +2409,23 @@ async def on_edit_alerts(cb: CallbackQuery, state: FSMContext):
     selected: Set[str] = set(data.get("selected_alerts", []))
     asset_id = int(data.get("asset_id"))
     entry = float(data.get("entry", 0.0))
+    force_finish = False
 
     if action == "none":
         selected = set()
         await state.update_data(selected_alerts=list(selected))
-        await cb.message.edit_reply_markup(reply_markup=alerts_kb(selected))
-        return await cb.answer("Без алертов")
+        force_finish = True
+
+    if force_finish:
+        action = "done"
 
     if action == "done":
         if entry <= 0:
             await drop_last_prompt(state, cb.bot)
             await state.clear()
             await safe_delete(cb.message)
-            await cb.message.answer("Цена входа = 0, алерты не сохранены.", reply_markup=main_menu_kb())
-            return await cb.answer("Нет цены входа")
+            await cb.answer("Нет цены входа", show_alert=True)
+            return
 
         alert_rows: List[Tuple[str, int, float]] = []
         for s in sorted(selected):
@@ -2430,10 +2437,13 @@ async def on_edit_alerts(cb: CallbackQuery, state: FSMContext):
         await replace_alerts(asset_id, alert_rows)
         await invalidate_summary_cache(cb.from_user.id)
         await state.clear()
-        await cb.message.answer("Алерты обновлены ✅", reply_markup=main_menu_kb())
-        return await cb.answer("Сохранено")
+        await safe_delete(cb.message)
 
-    allowed = {f"RISK:{p}" for p in RISK_LEVELS} | {f"TP:{p}" for p in TP_LEVELS}
+        toast = "Алерты отключены ✅" if force_finish else "Алерты обновлены ✅"
+        await cb.answer(toast, show_alert=True)
+        return
+
+    allowed = {f"RISK:{p}" for p in RISK_LEVELS} | {f"TP:{p}" for p in TP_LEVELС}
     if action in allowed:
         if action in selected:
             selected.remove(action)
@@ -2515,9 +2525,7 @@ async def on_delete_asset(cb: CallbackQuery, state: FSMContext):
 
     await drop_last_prompt(state, cb.bot)
     await safe_delete(cb.message)
-
-    await cb.message.answer(f"Удалил {safe_symbol(a['symbol'])} ✅", reply_markup=main_menu_kb())
-    await cb.answer("Удалено")
+    await cb.answer("Актив удалён ✅", show_alert=True)
 
 # ------- edit -------
 @router.message(F.text == "✏️ Редактировать список активов")
@@ -2609,10 +2617,11 @@ async def on_edit_delete_asset(cb: CallbackQuery, state: FSMContext):
     removed_sym = safe_symbol(a['symbol'])
 
     if not assets:
+        await drop_last_prompt(state, cb.bot)
+        await safe_delete(cb.message)
         await state.clear()
-        await cb.message.answer(f"Удалил {removed_sym} ✅\nАктивов больше нет.", reply_markup=main_menu_kb())
-        await cb.answer("Удалено")
-        return
+        await cb.message.answer("Активов больше нет.", reply_markup=main_menu_kb())
+        return await cb.answer("Актив удалён ✅", show_alert=True)
 
     await state.clear()
     await state.set_state(EditAssetFSM.choose_asset)
@@ -2621,7 +2630,7 @@ async def on_edit_delete_asset(cb: CallbackQuery, state: FSMContext):
         f"Удалил {removed_sym} ✅\n\nВыбери следующий актив:",
         reply_markup=assets_edit_list_kb(assets)
     )
-    await cb.answer("Удалено")
+    await cb.answer("Актив удалён ✅", show_alert=True)
 
 @router.callback_query(EditAssetFSM.choose_asset, F.data.startswith("edit:asset:"))
 async def on_edit_choose(cb: CallbackQuery, state: FSMContext):
