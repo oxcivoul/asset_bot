@@ -15,7 +15,7 @@ from aiohttp import web
 import asyncpg
 
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.filters import CommandStart, Command, StateFilter
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery,
     ReplyKeyboardMarkup, KeyboardButton,
@@ -279,6 +279,9 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
 
 def back_to_menu_row() -> List[InlineKeyboardButton]:
     return [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="nav:menu:delete")]
+
+def back_to_menu_inline() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[back_to_menu_row()])
 
 def summary_kb(page: int, total_pages: int) -> InlineKeyboardMarkup:
     rows = [
@@ -1062,7 +1065,6 @@ async def delete_all_user_data(user_id: int, delete_snapshots: bool = True):
 def reset_confirm_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Да, удалить всё", callback_data="reset:yes")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="reset:no")],
         back_to_menu_row(),
     ])
 
@@ -1520,80 +1522,6 @@ def format_top_block(label: str, comp: AssetComputed) -> str:
     ])
 
 
-async def build_top_moves_text(user_id: int) -> str:
-    tz_name = await get_user_tz_name(user_id)
-    tz = resolve_tz(tz_name)
-
-    assets = await list_assets(user_id)
-    if not assets:
-        return (
-            "⚡️ <b>ТОП-движения портфеля</b>\n\n"
-            "Портфель пуст. Добавь актив через меню, чтобы увидеть лидеров и аутсайдеров."
-        )
-
-    ids = sorted({a["coingecko_id"] for a in assets})
-    price_map: Dict[str, float] = {}
-    price_ts: Optional[float] = None
-    try:
-        price_map, missing, price_ts = await ensure_prices(
-            ids,
-            max_age=PRICE_POLL_SECONDS,
-            direct_ttl=PRICE_TTL_SEC,
-            need_timestamp=True,
-            priority="user",
-        )
-        if missing:
-            log.warning("Top moves: missing prices for %s", ", ".join(missing))
-    except Exception as e:
-        log.warning("Top moves price fetch failed: %r", e)
-
-    computed: List[AssetComputed] = []
-    for a in assets:
-        current_price = price_map.get(a["coingecko_id"])
-        if current_price is None:
-            continue
-        comp = compute_asset(a, current_price)
-        if comp.pnl_usd is None:
-            continue
-        computed.append(comp)
-
-    if not computed:
-        return (
-            "⚡️ <b>ТОП-движения портфеля</b>\n\n"
-            "Не удалось получить актуальные цены для расчёта. Попробуй позже команду /summary."
-        )
-
-    top_gainer = max(computed, key=lambda c: c.pnl_usd)
-    top_loser = min(computed, key=lambda c: c.pnl_usd)
-    single_asset = top_gainer.asset_id == top_loser.asset_id
-
-    price_dt = datetime.fromtimestamp(price_ts, tz) if price_ts else datetime.now(tz)
-    price_time_text = price_dt.strftime("%H:%M:%S")
-
-    lines = [
-        "⚡️ <b>ТОП-движения портфеля</b>",
-        f"Цены CoinGecko: {price_time_text} ({tz_name})",
-        "",
-        format_top_block("Лидер роста", top_gainer),
-    ]
-
-    if single_asset:
-        lines.extend([
-            "",
-            "В портфеле только один актив, поэтому он же и аутсайдер.",
-        ])
-    else:
-        lines.extend([
-            "",
-            format_top_block("Аутсайдер", top_loser),
-        ])
-
-    lines.extend([
-        "",
-        "Полная детализация: открой кнопку «📊 Сводка» в меню."
-    ])
-    return "\n".join(lines)
-
 async def build_summary_text(user_id: int, *, force_refresh: bool = False) -> str:
     tz_name = await get_user_tz_name(user_id)
     tz = resolve_tz(tz_name)
@@ -1737,7 +1665,7 @@ async def build_summary_text(user_id: int, *, force_refresh: bool = False) -> st
     footer_lines.extend([
         "<b>🛠 FAQ</b>",
         f"🕒 Цены CoinGecko: {price_time_text} ({tz_name})",
-        "• /about • /help • /reset • /settings",
+        "• /about • /help • /reset",
     ])
 
     return "📊 <b>Сводка портфеля</b>\n\n" + "\n\n".join(blocks) + "\n\n" + "\n".join(footer_lines)
@@ -1766,7 +1694,6 @@ def add_mode_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Обычная позиция", callback_data="add:mode:paid")],
         [InlineKeyboardButton(text="Бесплатная позиция", callback_data="add:mode:free")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="flow:cancel")],
         back_to_menu_row(),
     ])
 
@@ -1782,7 +1709,6 @@ def coin_choice_kb(coins: List[dict]) -> InlineKeyboardMarkup:
             text=f"{sym} — {name}",
             callback_data=f"add:coin:{cid}"
         )])
-    kb.append([InlineKeyboardButton(text="❌ Отмена", callback_data="flow:cancel")])
     kb.append(back_to_menu_row())
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
@@ -1806,7 +1732,6 @@ def alerts_kb(selected: Set[str]) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="🚫 Без алертов", callback_data="add:alert:none"),
         InlineKeyboardButton(text="💾 Готово", callback_data="add:alert:done"),
     ])
-    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="flow:cancel")])
     rows.append(back_to_menu_row())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1880,8 +1805,8 @@ def assets_edit_list_kb(assets_rows, *, page: int = 0) -> InlineKeyboardMarkup:
 def edit_actions_kb(asset_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗑 Удалить этот актив", callback_data=f"edit:delete:{asset_id}")],
-        [InlineKeyboardButton(text="⬅️ К списку", callback_data="nav:edit"),
-         InlineKeyboardButton(text="⬅️ В меню", callback_data="nav:menu:delete")]
+        [InlineKeyboardButton(text="⬅️ К списку", callback_data="nav:edit")],
+        back_to_menu_row(),
     ])
 
 # ---------------------------- router/handlers ----------------------------
@@ -1898,18 +1823,18 @@ async def on_start(m: Message):
 
 @router.message(Command("help"))
 async def on_help(m: Message):
-    await m.answer(
+    text = (
         "📚 <b>Что умеет бот</b>\n"
-        "• /summary — мгновенно покажет лидера и аутсайдера портфеля\n"
-        "• Кнопка «📊 Сводка» — полный отчёт по всем активам, алертам и PNL\n"
-        "• Алерты: фиксированные уровни по выбранным %, срабатывают на цели и переcобираются после выхода из коридора ±0.3%\n"
-        "• Free-позиции: укажи цену входа и количество, PNL считается от базы entry × qty\n"
-        "• /tz Region/City — смена часового пояса\n"
-        "• /reset — удалить все данные\n\n"
-        "Подсказки:\n"
-        "• Кнопка «Обновить» в сводке сначала показывает кэш (≤3 минут), потом тянет свежие цены\n"
-        "• Если застрял в мастере добавления — командой /settings всё сбросится и покажет текущие настройки"
+        "• «📊 Сводка» — полный отчёт по активам, PNL и алертам\n"
+        "• Алерты фиксированных уровней с гистерезисом\n"
+        "• Free-позиции считают базу по entry × qty\n"
+        "• «📅/🗓 PNL» — изменения за 7 и 30 дней\n"
+        "\n"
+        "Команды:\n"
+        "/about — информация о проекте\n"
+        "/reset — удалить все данные"
     )
+    await m.answer(text, reply_markup=back_to_menu_inline())
 
 @router.message(Command("about"))
 async def on_about(m: Message):
@@ -1917,45 +1842,9 @@ async def on_about(m: Message):
         f"Версия бота: alpha {VERSION}\n"
         "Источник цен: CoinGecko (FREE)\n"
         "Автор: @playerholygrail\n"
-        "Репо: https://github.com/oxcivoul/asset_bot"
+        "Репо: https://github.com/oxcivoul/asset_bot",
+        reply_markup=back_to_menu_inline()
     )
-
-@router.message(Command("summary"))
-async def on_summary_cmd(m: Message):
-    await upsert_user(m.from_user.id)
-    text = await build_top_moves_text(m.from_user.id)
-    await m.answer(text)
-
-@router.message(Command(commands={"settings", "setting"}), StateFilter("*"))
-async def on_settings(m: Message, state: FSMContext):
-    await state.clear()
-    await upsert_user(m.from_user.id)
-
-    tz_name = await get_user_tz_name(m.from_user.id)
-    assets = await list_assets(m.from_user.id)
-
-    row = await db_fetchone(
-        "SELECT last_summary_cached_at FROM users WHERE user_id=$1",
-        (m.from_user.id,)
-    )
-    cache_ts = (row or {}).get("last_summary_cached_at")
-    if cache_ts is not None:
-        age = max(0, SUMMARY_CACHE_TTL_SEC - int(time.time() - cache_ts))
-        cache_line = f"Кэш сводки: активен, обновится через {age}s"
-    else:
-        cache_line = "Кэш сводки: нет (появится после первой /summary)"
-
-    text = "\n".join([
-        "⚙️ <b>Настройки</b>",
-        f"Часовой пояс: {tz_name}",
-        f"Активов в портфеле: {len(assets)}",
-        cache_line,
-        "",
-        "Команды:",
-        "/tz &lt;Region/City&gt; — изменить часовой пояс",
-        "/reset — сбросить данные"
-    ])
-    await m.answer(text, reply_markup=main_menu_kb())
 
 @router.message(F.text == "📊 Сводка")
 async def on_summary(m: Message):
@@ -1978,33 +1867,12 @@ async def on_reset(m: Message):
         reply_markup=reset_confirm_kb()
     )
 
-@router.message(Command("tz"))
-async def on_tz(m: Message):
-    await upsert_user(m.from_user.id)
-    parts = (m.text or "").split(maxsplit=1)
-    if len(parts) == 1:
-        current = await get_user_tz_name(m.from_user.id)
-        return await m.answer(f"Текущий часовой пояс: {current}\nУстановить: /tz Europe/Moscow")
-    tz_name = parts[1].strip()
-    try:
-        ZoneInfo(tz_name)
-    except Exception:
-        return await m.answer("Не понял часовой пояс. Пример: /tz Europe/Moscow")
-    await set_user_tz_name(m.from_user.id, tz_name)
-    await m.answer(f"Часовой пояс обновлён: {tz_name}")
-
 @router.callback_query(F.data == "reset:yes")
 async def on_reset_yes(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await delete_all_user_data(cb.from_user.id, delete_snapshots=True)
     await cb.message.answer("Данные удалены. Начинаем с чистого листа.", reply_markup=main_menu_kb())
     await cb.answer("Удалено")
-
-@router.callback_query(F.data == "reset:no")
-async def on_reset_no(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await cb.message.answer("Отменено. Меню:", reply_markup=main_menu_kb())
-    await cb.answer("Отменено")
 
 @router.callback_query(F.data.startswith("summary:refresh"))
 async def on_summary_refresh(cb: CallbackQuery):
@@ -2091,7 +1959,6 @@ async def on_nav_menu(cb: CallbackQuery, state: FSMContext):
         await cb.message.delete()
     except TelegramBadRequest:
         pass
-    await cb.message.answer("Меню:", reply_markup=main_menu_kb())
     await cb.answer("Меню открыто")
 
 @router.callback_query(F.data == "nav:add")
@@ -2158,9 +2025,9 @@ async def on_add_ticker(m: Message, state: FSMContext):
     await state.update_data(coins=coins_sorted[:10])
     await state.set_state(AddAssetFSM.choose_coin)
     await m.answer(
-    "Выбери монету (у тикеров бывают совпадения):",
-    reply_markup=coin_choice_kb(coins_sorted)
-)
+        "Выбери монету (у тикеров бывают совпадения):",
+        reply_markup=coin_choice_kb(coins_sorted)
+    )
 
 @router.callback_query(AddAssetFSM.choose_coin, F.data.startswith("add:coin:"))
 async def on_add_choose_coin(cb: CallbackQuery, state: FSMContext):
@@ -2187,7 +2054,7 @@ async def on_add_choose_coin(cb: CallbackQuery, state: FSMContext):
         await state.set_state(AddAssetFSM.entry)
         kb_info = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="ℹ️ Как считать free-позиции", callback_data="info:free")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="flow:cancel")]
+            back_to_menu_row(),
         ])
         await cb.message.answer(
             "Бесплатная позиция.\n"
@@ -2198,13 +2065,10 @@ async def on_add_choose_coin(cb: CallbackQuery, state: FSMContext):
         return
 
     await state.set_state(AddAssetFSM.invested)
-    await cb.message.answer("Введи сумму, на которую купил (в USD). Например 1000:")
-    await cb.answer()
-
-@router.callback_query(F.data == "flow:cancel")
-async def on_flow_cancel(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await cb.message.answer("Ок, отменил.", reply_markup=main_menu_kb())
+    await cb.message.answer(
+        "Введи сумму, на которую купил (в USD). Например 1000:",
+        reply_markup=back_to_menu_inline()
+    )
     await cb.answer()
 
 @router.callback_query(AddAssetFSM.mode, F.data.startswith("add:mode:"))
@@ -2222,7 +2086,10 @@ async def on_add_mode(cb: CallbackQuery, state: FSMContext):
     except Exception:
         pass
 
-    await cb.message.answer("Введи тикер/название монеты (пример: BTC, ETH, SOL):")
+    await cb.message.answer(
+        "Введи тикер/название монеты (пример: BTC, ETH, SOL):",
+        reply_markup=back_to_menu_inline()
+    )
     await cb.answer()
 
 @router.callback_query(F.data == "info:free")
@@ -2281,7 +2148,10 @@ async def on_add_invested(m: Message, state: FSMContext):
         return await m.answer("Сумма не может быть отрицательной.")
     await state.update_data(invested=float(v))
     await state.set_state(AddAssetFSM.entry)
-    await m.answer("Введи цену входа (USD), например 40000:")
+    await m.answer(
+        "Введи цену входа (USD), например 40000:",
+        reply_markup=back_to_menu_inline()
+    )
 
 @router.message(AddAssetFSM.entry)
 async def on_add_entry(m: Message, state: FSMContext):
@@ -2301,7 +2171,8 @@ async def on_add_entry(m: Message, state: FSMContext):
         await state.set_state(AddAssetFSM.quantity)
         return await m.answer(
             "Введи количество монет (например 123.4567):\n"
-            "PNL и алерты будут считаться от этой цены входа."
+            "PNL и алерты будут считаться от этой цены входа.",
+            reply_markup=back_to_menu_inline()
         )
 
     await state.update_data(selected_alerts=[], qty_override=None)
@@ -2686,7 +2557,7 @@ async def on_pnl_period(m: Message):
         return await m.answer(
             "Пока нет истории для недели/месяца.\n"
             "Я записываю снапшоты раз в час — чуть времени и будет статистика.",
-            reply_markup=main_menu_kb()
+            reply_markup=back_to_menu_inline()
         )
 
     days = 7 if m.text.startswith("📅") else 30
@@ -2696,7 +2567,7 @@ async def on_pnl_period(m: Message):
         return await m.answer(
             f"Недостаточно данных, чтобы посчитать за {days} дней.\n"
             "Нужно, чтобы накопились снапшоты.",
-            reply_markup=main_menu_kb()
+            reply_markup=back_to_menu_inline()
         )
 
     now_pnl = float(latest["total_pnl_usd"])
@@ -2712,7 +2583,7 @@ async def on_pnl_period(m: Message):
             f"PNL тогда: {sign_money(then_pnl)}",
             f"PNL сейчас: {sign_money(now_pnl)}",
         ]),
-        reply_markup=main_menu_kb()
+        reply_markup=back_to_menu_inline()
     )
 
 # ---------------------------- background loops ----------------------------
@@ -2878,7 +2749,7 @@ async def alerts_loop():
 
                     base_invested = invested if invested > 0 else qty * entry
                     pnl_usd = qty * cur - base_invested
-                    pnl_pct = None if base_investед == 0 else pnl_usd / base_investед * 100.0
+                    pnl_pct = None if base_invested == 0 else pnl_usd / base_invested * 100.0
                     pct_text = "—" if pnl_pct is None else sign_pct(pnl_pct)
 
                     icon = "🔴" if alert_type == "RISK" else "🟢"
