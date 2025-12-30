@@ -306,6 +306,9 @@ async def send_step_prompt(target: Message, state: FSMContext, text: str, *, rep
     )
     return msg
 
+async def send_menu(bot: Bot, chat_id: int):
+    await bot.send_message(chat_id, "Меню снова на месте 👇", reply_markup=main_menu_kb())
+
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -1914,8 +1917,8 @@ async def on_reset(m: Message):
 async def on_reset_yes(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await delete_all_user_data(cb.from_user.id, delete_snapshots=True)
-    await cb.message.answer("Данные удалены. Начинаем с чистого листа.", reply_markup=main_menu_kb())
-    await cb.answer("Удалено")
+    await cb.answer("Данные удалены ✅", show_alert=True)
+    await send_menu(cb.bot, cb.message.chat.id)
 
 @router.callback_query(F.data.startswith("summary:refresh"))
 async def on_summary_refresh(cb: CallbackQuery):
@@ -2131,15 +2134,11 @@ async def on_add_choose_coin(cb: CallbackQuery, state: FSMContext):
     if mode == "free":
         await state.update_data(invested=0.0)
         await state.set_state(AddAssetFSM.entry)
-        kb_info = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="ℹ️ Как считать free-позиции", callback_data="info:free")],
-            back_to_menu_row(),
-        ])
         await send_step_prompt(
             cb.message, state,
             "Бесплатная позиция.\n"
             "Введи цену, по которой досталась монета (USD). Нужно > 0, чтобы считать PNL и алерты:",
-            reply_markup=kb_info
+            reply_markup=back_to_menu_inline()   # ← больше никаких лишних кнопок
         )
         await cb.answer()
         return
@@ -2173,10 +2172,9 @@ async def on_add_mode(cb: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "info:free")
 async def on_info_free(cb: CallbackQuery):
     await cb.answer(
-        "Как считать free-позиции:\n"
-        "1) Укажи цену входа (>0) — по ней считаются база и алерты.\n"
-        "2) Укажи количество монет — по нему считается стоимость и PNL.\n"
-        "PNL идёт от базы (entry * qty), даже если вложено = 0.",
+        "Бесплатные позиции считаются так:\n"
+        "• entry > 0 — база и алерты\n"
+        "• qty — руками, от него считаем стоимость и PNL",
         show_alert=True
     )
 
@@ -2388,7 +2386,9 @@ async def on_add_alerts(cb: CallbackQuery, state: FSMContext):
         await safe_delete(cb.message)
 
         toast = "Актив добавлен без алертов ✅" if force_finish else "Актив добавлен ✅"
-        return await cb.answer(toast, show_alert=True)
+        await cb.answer(toast, show_alert=True)
+        await send_menu(cb.bot, cb.message.chat.id)
+        return
 
     allowed = {f"RISK:{p}" for p in RISK_LEVELS} | {f"TP:{p}" for p in TP_LEVELS}
     if action in allowed:
@@ -2441,6 +2441,7 @@ async def on_edit_alerts(cb: CallbackQuery, state: FSMContext):
 
         toast = "Алерты отключены ✅" if force_finish else "Алерты обновлены ✅"
         await cb.answer(toast, show_alert=True)
+        await send_menu(cb.bot, cb.message.chat.id)
         return
 
     allowed = {f"RISK:{p}" for p in RISK_LEVELS} | {f"TP:{p}" for p in TP_LEVELС}
@@ -2526,6 +2527,7 @@ async def on_delete_asset(cb: CallbackQuery, state: FSMContext):
     await drop_last_prompt(state, cb.bot)
     await safe_delete(cb.message)
     await cb.answer("Актив удалён ✅", show_alert=True)
+    await send_menu(cb.bot, cb.message.chat.id)
 
 # ------- edit -------
 @router.message(F.text == "✏️ Редактировать список активов")
@@ -2609,7 +2611,6 @@ async def on_edit_delete_asset(cb: CallbackQuery, state: FSMContext):
         return await cb.answer("Актив не найден")
 
     await delete_asset_row(cb.from_user.id, asset_id)
-
     await drop_last_prompt(state, cb.bot)
     await safe_delete(cb.message)
 
@@ -2617,11 +2618,10 @@ async def on_edit_delete_asset(cb: CallbackQuery, state: FSMContext):
     removed_sym = safe_symbol(a['symbol'])
 
     if not assets:
-        await drop_last_prompt(state, cb.bot)
-        await safe_delete(cb.message)
         await state.clear()
-        await cb.message.answer("Активов больше нет.", reply_markup=main_menu_kb())
-        return await cb.answer("Актив удалён ✅", show_alert=True)
+        await cb.answer("Актив удалён ✅", show_alert=True)
+        await send_menu(cb.bot, cb.message.chat.id)
+        return
 
     await state.clear()
     await state.set_state(EditAssetFSM.choose_asset)
@@ -2715,7 +2715,8 @@ async def on_edit_entry(m: Message, state: FSMContext):
     await update_asset_row(m.from_user.id, asset_id, invested, entry, qty_override=None)
     await recompute_alert_targets(asset_id, entry)
     await state.clear()
-    await m.answer("Обновил ✅", reply_markup=main_menu_kb())
+    await m.answer("Обновил ✅")
+    await send_menu(m.bot, m.chat.id)
 
 @router.message(EditAssetFSM.quantity)
 async def on_edit_quantity(m: Message, state: FSMContext):
@@ -2739,7 +2740,8 @@ async def on_edit_quantity(m: Message, state: FSMContext):
     await update_asset_row(m.from_user.id, asset_id, invested, entry, qty_override=float(qty))
     await recompute_alert_targets(asset_id, entry)
     await state.clear()
-    await m.answer("Обновил ✅", reply_markup=main_menu_kb())
+    await m.answer("Обновил ✅")
+    await send_menu(m.bot, m.chat.id)
 
 # ------- pnl periods -------
 @router.message(F.text.in_(["📅 PNL за неделю", "🗓 PNL за месяц"]))
