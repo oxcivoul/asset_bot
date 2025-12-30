@@ -277,6 +277,9 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         resize_keyboard=True
     )
 
+def back_to_menu_row() -> List[InlineKeyboardButton]:
+    return [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="nav:menu:delete")]
+
 def summary_kb(page: int, total_pages: int) -> InlineKeyboardMarkup:
     rows = [
         [
@@ -299,6 +302,7 @@ def summary_kb(page: int, total_pages: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="➡️", callback_data=next_cb)
         ])
 
+    rows.append(back_to_menu_row())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def fmt_usd(x: float) -> str:
@@ -1059,6 +1063,7 @@ def reset_confirm_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Да, удалить всё", callback_data="reset:yes")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="reset:no")],
+        back_to_menu_row(),
     ])
 
 async def upsert_user(user_id: int, *, auto_unmute: bool = True):
@@ -1761,7 +1766,8 @@ def add_mode_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Обычная позиция", callback_data="add:mode:paid")],
         [InlineKeyboardButton(text="Бесплатная позиция", callback_data="add:mode:free")],
-        [InlineKeyboardButton(text="Отмена", callback_data="flow:cancel")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="flow:cancel")],
+        back_to_menu_row(),
     ])
 
 def coin_choice_kb(coins: List[dict]) -> InlineKeyboardMarkup:
@@ -1777,10 +1783,10 @@ def coin_choice_kb(coins: List[dict]) -> InlineKeyboardMarkup:
             callback_data=f"add:coin:{cid}"
         )])
     kb.append([InlineKeyboardButton(text="❌ Отмена", callback_data="flow:cancel")])
+    kb.append(back_to_menu_row())
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 def alerts_kb(selected: Set[str]) -> InlineKeyboardMarkup:
-    # selected holds "RISK:5" "TP:10"
     rows = []
     r1 = []
     for p in RISK_LEVELS:
@@ -1801,6 +1807,7 @@ def alerts_kb(selected: Set[str]) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="💾 Готово", callback_data="add:alert:done"),
     ])
     rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="flow:cancel")])
+    rows.append(back_to_menu_row())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def assets_list_kb(assets_rows, prefix: str, page: int = 0) -> InlineKeyboardMarkup:
@@ -1828,7 +1835,7 @@ def assets_list_kb(assets_rows, prefix: str, page: int = 0) -> InlineKeyboardMar
             InlineKeyboardButton(text="➡️", callback_data=next_cb),
         ])
 
-    kb.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="nav:menu")])
+    kb.append(back_to_menu_row())
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 def assets_edit_list_kb(assets_rows, *, page: int = 0) -> InlineKeyboardMarkup:
@@ -1839,6 +1846,7 @@ def assets_edit_list_kb(assets_rows, *, page: int = 0) -> InlineKeyboardMarkup:
     start = page * page_size
     end = start + page_size
     visible = assets_rows[start:end]
+    prefix = "editlist"  # ← добавь вот эту строку
 
     kb: List[List[InlineKeyboardButton]] = []
     for a in visible:
@@ -1858,7 +1866,6 @@ def assets_edit_list_kb(assets_rows, *, page: int = 0) -> InlineKeyboardMarkup:
         ])
 
     if total_pages > 1:
-        prefix = "editlist"
         prev_cb = f"{prefix}:page:{page - 1}" if page > 0 else f"{prefix}:noop"
         next_cb = f"{prefix}:page:{page + 1}" if page + 1 < total_pages else f"{prefix}:noop"
         kb.append([
@@ -1867,14 +1874,14 @@ def assets_edit_list_kb(assets_rows, *, page: int = 0) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="➡️", callback_data=next_cb),
         ])
 
-    kb.append([InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="nav:menu")])
+    kb.append(back_to_menu_row())
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 def edit_actions_kb(asset_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗑 Удалить этот актив", callback_data=f"edit:delete:{asset_id}")],
         [InlineKeyboardButton(text="⬅️ К списку", callback_data="nav:edit"),
-         InlineKeyboardButton(text="⬅️ В меню", callback_data="nav:menu")]
+         InlineKeyboardButton(text="⬅️ В меню", callback_data="nav:menu:delete")]
     ])
 
 # ---------------------------- router/handlers ----------------------------
@@ -2077,11 +2084,15 @@ async def on_summary_page(cb: CallbackQuery):
 async def on_summary_noop(cb: CallbackQuery):
     await cb.answer()
 
-@router.callback_query(F.data == "nav:menu")
+@router.callback_query(F.data.in_(("nav:menu", "nav:menu:delete")))
 async def on_nav_menu(cb: CallbackQuery, state: FSMContext):
     await state.clear()
+    try:
+        await cb.message.delete()
+    except TelegramBadRequest:
+        pass
     await cb.message.answer("Меню:", reply_markup=main_menu_kb())
-    await cb.answer()
+    await cb.answer("Меню открыто")
 
 @router.callback_query(F.data == "nav:add")
 async def on_nav_add(cb: CallbackQuery, state: FSMContext):
