@@ -276,6 +276,12 @@ async def remember_origin_message(state: FSMContext, message: Message):
         origin_message_id=message.message_id
     )
 
+async def safe_delete(message: Message):
+    try:
+        await message.delete()
+    except TelegramBadRequest:
+        pass
+
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -1984,6 +1990,8 @@ async def on_nav_menu(cb: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "nav:add")
 async def on_nav_add(cb: CallbackQuery, state: FSMContext):
+    await safe_delete(cb.message)
+
     await upsert_user(cb.from_user.id)
     await state.clear()
     await state.set_state(AddAssetFSM.mode)
@@ -2063,6 +2071,8 @@ async def on_add_choose_coin(cb: CallbackQuery, state: FSMContext):
         await state.clear()
         return
 
+    await safe_delete(cb.message)
+
     mode = (data.get("add_mode") or "paid").strip().lower()
 
     await state.update_data(
@@ -2102,11 +2112,7 @@ async def on_add_mode(cb: CallbackQuery, state: FSMContext):
     await state.update_data(add_mode=mode)
     await state.set_state(AddAssetFSM.ticker)
 
-    # Убираем клавиатуру, чтобы не нажимали второй раз и не было “вечной загрузки” в клиенте
-    try:
-        await cb.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
+    await safe_delete(cb.message)
 
     await cb.message.answer(
         "Введи тикер/название монеты (пример: BTC, ETH, SOL):",
@@ -2160,6 +2166,7 @@ async def on_edit_alerts_start(cb: CallbackQuery, state: FSMContext):
         "",
         "Отметь уровни и нажми «💾 Готово»"
     ])
+    await safe_delete(cb.message)
     await cb.message.answer(msg, reply_markup=alerts_kb(selected))
     await cb.answer()
 
@@ -2302,6 +2309,7 @@ async def on_add_alerts(cb: CallbackQuery, state: FSMContext):
 
         await invalidate_summary_cache(cb.from_user.id)
         await state.clear()
+        await safe_delete(cb.message)
         await cb.message.answer("Готово ✅ Актив добавлен.", reply_markup=main_menu_kb())
         return await cb.answer("Сохранено")
     # toggle
@@ -2334,6 +2342,7 @@ async def on_edit_alerts(cb: CallbackQuery, state: FSMContext):
     if action == "done":
         if entry <= 0:
             await state.clear()
+            await safe_delete(cb.message)
             await cb.message.answer("Цена входа = 0, алерты не сохранены.", reply_markup=main_menu_kb())
             return await cb.answer("Нет цены входа")
 
@@ -2578,6 +2587,7 @@ async def on_edit_quantity(m: Message, state: FSMContext):
 # ------- pnl periods -------
 @router.message(F.text.in_(["📅 PNL за неделю", "🗓 PNL за месяц"]))
 async def on_pnl_period(m: Message):
+    await safe_delete(m)
     await upsert_user(m.from_user.id)
     latest = await get_snapshot_latest(m.from_user.id)
     if not latest:
