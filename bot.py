@@ -282,6 +282,30 @@ async def safe_delete(message: Message):
     except TelegramBadRequest:
         pass
 
+PROMPT_CHAT_KEY = "last_prompt_chat_id"
+PROMPT_MSG_KEY = "last_prompt_message_id"
+
+async def drop_last_prompt(state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    chat_id = data.get(PROMPT_CHAT_KEY)
+    msg_id = data.get(PROMPT_MSG_KEY)
+    if chat_id and msg_id:
+        try:
+            await bot.delete_message(chat_id, msg_id)
+        except TelegramBadRequest:
+            pass
+    await state.update_data(
+        **{PROMPT_CHAT_KEY: None, PROMPT_MSG_KEY: None}
+    )
+
+async def send_step_prompt(target: Message, state: FSMContext, text: str, *, reply_markup):
+    await drop_last_prompt(state, target.bot)
+    msg = await target.answer(text, reply_markup=reply_markup)
+    await state.update_data(
+        **{PROMPT_CHAT_KEY: msg.chat.id, PROMPT_MSG_KEY: msg.message_id}
+    )
+    return msg
+
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -1831,13 +1855,14 @@ router = Router()
 async def on_start(m: Message):
     await upsert_user(m.from_user.id)
     await m.answer(
-        "Здарова! Я бот-учёт активов: считаю PNL, показываю сводку и шлёпну алертом, если цена дошла до уровня.\n\n"
+        "Здарова! Я бот-менеджер активов: считаю PNL, показываю сводку и присылаю алерты, если цена дошла до уровня.\n\n"
         "Выбирай действие в меню.",
         reply_markup=main_menu_kb()
     )
 
 @router.message(Command("help"))
 async def on_help(m: Message):
+    await safe_delete(m)
     text = (
         "📚 <b>Что умеет бот</b>\n"
         "• «📊 Сводка» — полный отчёт по активам, PNL и алертам\n"
@@ -1853,6 +1878,7 @@ async def on_help(m: Message):
 
 @router.message(Command("about"))
 async def on_about(m: Message):
+    await safe_delete(m)
     await m.answer(
         f"Версия бота: alpha {VERSION}\n"
         "Источник цен: CoinGecko (FREE)\n"
@@ -1863,6 +1889,7 @@ async def on_about(m: Message):
 
 @router.message(F.text == "📊 Сводка")
 async def on_summary(m: Message):
+    await safe_delete(m)  # ← вот эта строка
     await upsert_user(m.from_user.id)
     pages, warning = await get_summary_pages_safe(m.from_user.id, force_refresh=False)
     if pages is None:
@@ -1877,6 +1904,7 @@ async def on_summary(m: Message):
 
 @router.message(Command("reset"))
 async def on_reset(m: Message):
+    await safe_delete(m)
     await m.answer(
         "Вы уверены, что хотите удалить ВСЕ свои активы и снимки PNL? Это действие необратимо.",
         reply_markup=reset_confirm_kb()
@@ -1969,6 +1997,7 @@ async def on_summary_noop(cb: CallbackQuery):
 
 @router.callback_query(F.data.in_(("nav:menu", "nav:menu:delete")))
 async def on_nav_menu(cb: CallbackQuery, state: FSMContext):
+    await drop_last_prompt(state, cb.bot)
     data = await state.get_data()
     origin_chat_id = data.get("origin_chat_id")
     origin_message_id = data.get("origin_message_id")
@@ -1991,11 +2020,10 @@ async def on_nav_menu(cb: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "nav:add")
 async def on_nav_add(cb: CallbackQuery, state: FSMContext):
     await safe_delete(cb.message)
-
     await upsert_user(cb.from_user.id)
     await state.clear()
     await state.set_state(AddAssetFSM.mode)
-    await cb.message.answer("Выбери тип позиции:", reply_markup=add_mode_kb())
+    await send_step_prompt(cb.message, state, "Выбери тип позиции:", reply_markup=add_mode_kb())
     await cb.answer()
 
 @router.callback_query(F.data == "summary:info")
@@ -2024,37 +2052,55 @@ async def on_summary_info(cb: CallbackQuery):
         last_line,
         "Как только таймер истечёт, кнопка даст свежие цены."
     ])
-    await cb.message.answer(text)
+    await cb.message.answer(text, reply_markup=back_to_menu_inline())
     await cb.answer("Готово")
 
 @router.message(F.text == "➕ Добавить актив")
 async def on_add_asset_start(m: Message, state: FSMContext):
+    await safe_delete(m)
     await upsert_user(m.from_user.id)
     await state.clear()
     await remember_origin_message(state, m)
     await state.set_state(AddAssetFSM.mode)
-    await m.answer("Выбери тип позиции:", reply_markup=add_mode_kb())
+    await send_step_prompt(m, state, "Выбери тип позиции:", reply_markup=add_mode_kb())
 
 @router.message(AddAssetFSM.ticker)
 async def on_add_ticker(m: Message, state: FSMContext):
+    await safe_delete(m)
     q = (m.text or "").strip()
     if not q or len(q) > 40:
-        return await m.answer("Тикер слишком странный. Давай проще: BTC / ETH / SOL.")
+        await send_step_prompt(
+            m, state,
+            "Тикер слишком странный. Давай проще: BTC / ETH / SOL.",
+            reply_markup=back_to_menu_inline()
+        )
+        return
 
     try:
         coins = await cg.search(q)
     except Exception as e:
         log.warning("CoinGecko search failed: %r", e)
-        return await m.answer("CoinGecko не ответил. Попробуй ещё раз чуть позже.")
+        await send_step_prompt(
+            m, state,
+            "CoinGecko не ответил. Попробуй ещё раз чуть позже.",
+            reply_markup=back_to_menu_inline()
+        )
+        return
 
     if not coins:
-        return await m.answer("Ничего не нашёл. Попробуй другой запрос (например: bitcoin).")
+        await send_step_prompt(
+            m, state,
+            "Ничего не нашёл. Попробуй другой запрос (например: bitcoin).",
+            reply_markup=back_to_menu_inline()
+        )
+        return
 
     q_up = q.upper()
     coins_sorted = sorted(coins, key=lambda c: (c.get("symbol") != q_up, c.get("name") or ""))
     await state.update_data(coins=coins_sorted[:10])
     await state.set_state(AddAssetFSM.choose_coin)
-    await m.answer(
+    await send_step_prompt(
+        m, state,
         "Выбери монету (у тикеров бывают совпадения):",
         reply_markup=coin_choice_kb(coins_sorted)
     )
@@ -2067,8 +2113,9 @@ async def on_add_choose_coin(cb: CallbackQuery, state: FSMContext):
     chosen = next((c for c in coins if c.get("id") == cid), None)
 
     if not chosen:
-        await cb.answer("Не нашёл монету. Начни заново.")
+        await drop_last_prompt(state, cb.bot)
         await state.clear()
+        await cb.answer("Не нашёл монету. Начни заново.")
         return
 
     await safe_delete(cb.message)
@@ -2088,7 +2135,8 @@ async def on_add_choose_coin(cb: CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="ℹ️ Как считать free-позиции", callback_data="info:free")],
             back_to_menu_row(),
         ])
-        await cb.message.answer(
+        await send_step_prompt(
+            cb.message, state,
             "Бесплатная позиция.\n"
             "Введи цену, по которой досталась монета (USD). Нужно > 0, чтобы считать PNL и алерты:",
             reply_markup=kb_info
@@ -2097,7 +2145,8 @@ async def on_add_choose_coin(cb: CallbackQuery, state: FSMContext):
         return
 
     await state.set_state(AddAssetFSM.invested)
-    await cb.message.answer(
+    await send_step_prompt(
+        cb.message, state,
         "Введи сумму, на которую купил (в USD). Например 1000:",
         reply_markup=back_to_menu_inline()
     )
@@ -2114,7 +2163,8 @@ async def on_add_mode(cb: CallbackQuery, state: FSMContext):
 
     await safe_delete(cb.message)
 
-    await cb.message.answer(
+    await send_step_prompt(
+        cb.message, state,
         "Введи тикер/название монеты (пример: BTC, ETH, SOL):",
         reply_markup=back_to_menu_inline()
     )
@@ -2172,37 +2222,53 @@ async def on_edit_alerts_start(cb: CallbackQuery, state: FSMContext):
 
 @router.message(AddAssetFSM.invested)
 async def on_add_invested(m: Message, state: FSMContext):
+    await safe_delete(m)
+
     v = safe_float(m.text or "")
     if v is None or v < 0:
-        return await m.answer("Сумма не может быть отрицательной.")
+        await send_step_prompt(
+            m, state,
+            "Сумма не может быть отрицательной.",
+            reply_markup=back_to_menu_inline()
+        )
+        return
+
     await state.update_data(invested=float(v))
     await state.set_state(AddAssetFSM.entry)
-    await m.answer(
+    await send_step_prompt(
+        m, state,
         "Введи цену входа (USD), например 40000:",
         reply_markup=back_to_menu_inline()
     )
 
 @router.message(AddAssetFSM.entry)
 async def on_add_entry(m: Message, state: FSMContext):
+    await safe_delete(m)
+
     v = safe_float(m.text or "")
     if v is None or v <= 0:
-        return await m.answer("Цена входа должна быть больше 0.")
+        await send_step_prompt(
+            m, state,
+            "Цена входа должна быть больше 0.",
+            reply_markup=back_to_menu_inline()
+        )
+        return
 
     entry = float(v)
     data = await state.get_data()
     invested = float(data.get("invested", 0.0))
 
-    # для free-позиций (invested=0) цена входа обязана быть >0 — уже проверили выше
     await state.update_data(entry=entry)
 
-    # Если сумму/цену нельзя использовать для auto-qty — вводим количество вручную
     if invested == 0:
         await state.set_state(AddAssetFSM.quantity)
-        return await m.answer(
+        await send_step_prompt(
+            m, state,
             "Введи количество монет (например 123.4567):\n"
             "PNL и алерты будут считаться от этой цены входа.",
             reply_markup=back_to_menu_inline()
         )
+        return
 
     await state.update_data(selected_alerts=[], qty_override=None)
 
@@ -2219,20 +2285,26 @@ async def on_add_entry(m: Message, state: FSMContext):
         "Выбери алерты (можно несколько) и нажми «💾 Готово»:"
     ])
     await state.set_state(AddAssetFSM.alerts)
-    await m.answer(preview, reply_markup=alerts_kb(set()))
+    await send_step_prompt(m, state, preview, reply_markup=alerts_kb(set()))
 
 @router.message(AddAssetFSM.quantity)
 async def on_add_quantity(m: Message, state: FSMContext):
+    await safe_delete(m)
+
     qty = safe_float(m.text or "")
     if qty is None or qty <= 0:
-        return await m.answer("Количество должно быть больше нуля.")
+        await send_step_prompt(
+            m, state,
+            "Количество должно быть больше нуля.",
+            reply_markup=back_to_menu_inline()
+        )
+        return
 
     await state.update_data(qty_override=float(qty))
 
     data = await state.get_data()
     sym = (data.get("symbol") or "").upper()
     nm = data.get("name") or ""
-    coingecko_id = data.get("coingecko_id")
     invested = float(data.get("invested", 0.0))
     entry = float(data.get("entry", 0.0))
     qty_override = float(qty)
@@ -2254,7 +2326,7 @@ async def on_add_quantity(m: Message, state: FSMContext):
     ])
 
     await state.set_state(AddAssetFSM.alerts)
-    await m.answer(preview + note, reply_markup=alerts_kb(set()))
+    await send_step_prompt(m, state, preview + note, reply_markup=alerts_kb(set()))
 
 @router.callback_query(AddAssetFSM.alerts, F.data.startswith("add:alert:"))
 async def on_add_alerts(cb: CallbackQuery, state: FSMContext):
@@ -2308,6 +2380,7 @@ async def on_add_alerts(cb: CallbackQuery, state: FSMContext):
             await replace_alerts(asset_id, alert_rows)
 
         await invalidate_summary_cache(cb.from_user.id)
+        await drop_last_prompt(state, cb.bot)
         await state.clear()
         await safe_delete(cb.message)
         await cb.message.answer("Готово ✅ Актив добавлен.", reply_markup=main_menu_kb())
@@ -2341,6 +2414,7 @@ async def on_edit_alerts(cb: CallbackQuery, state: FSMContext):
 
     if action == "done":
         if entry <= 0:
+            await drop_last_prompt(state, cb.bot)
             await state.clear()
             await safe_delete(cb.message)
             await cb.message.answer("Цена входа = 0, алерты не сохранены.", reply_markup=main_menu_kb())
