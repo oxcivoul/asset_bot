@@ -267,6 +267,15 @@ async def send_queue_worker(bot: Bot, *, worker_id: int):
         source_queue.task_done()
 
 # ---------------------------- UI helpers ----------------------------
+async def remember_origin_message(state: FSMContext, message: Message):
+    data = await state.get_data()
+    if data.get("origin_message_id"):
+        return
+    await state.update_data(
+        origin_chat_id=message.chat.id,
+        origin_message_id=message.message_id
+    )
+
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -1954,11 +1963,23 @@ async def on_summary_noop(cb: CallbackQuery):
 
 @router.callback_query(F.data.in_(("nav:menu", "nav:menu:delete")))
 async def on_nav_menu(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    origin_chat_id = data.get("origin_chat_id")
+    origin_message_id = data.get("origin_message_id")
+
     await state.clear()
+
     try:
         await cb.message.delete()
     except TelegramBadRequest:
         pass
+
+    if origin_chat_id and origin_message_id:
+        try:
+            await cb.bot.delete_message(origin_chat_id, origin_message_id)
+        except TelegramBadRequest:
+            pass
+
     await cb.answer("Меню открыто")
 
 @router.callback_query(F.data == "nav:add")
@@ -2002,6 +2023,7 @@ async def on_summary_info(cb: CallbackQuery):
 async def on_add_asset_start(m: Message, state: FSMContext):
     await upsert_user(m.from_user.id)
     await state.clear()
+    await remember_origin_message(state, m)
     await state.set_state(AddAssetFSM.mode)
     await m.answer("Выбери тип позиции:", reply_markup=add_mode_kb())
 
@@ -2342,10 +2364,13 @@ async def on_edit_alerts(cb: CallbackQuery, state: FSMContext):
 
 # ------- delete -------
 @router.message(F.text == "🗑 Удалить актив")
-async def on_delete_menu(m: Message):
+async def on_delete_menu(m: Message, state: FSMContext):
     assets = await list_assets(m.from_user.id)
     if not assets:
         return await m.answer("Активов пока нет — удалять нечего.", reply_markup=main_menu_kb())
+
+    await state.clear()
+    await remember_origin_message(state, m)
     await m.answer("Выбери актив для удаления:", reply_markup=assets_list_kb(assets, "del"))
 
 @router.callback_query(F.data == "nav:delete")
@@ -2396,7 +2421,9 @@ async def on_edit_menu(m: Message, state: FSMContext):
     assets = await list_assets(m.from_user.id)
     if not assets:
         return await m.answer("Активов пока нет — редактировать нечего.", reply_markup=main_menu_kb())
+
     await state.clear()
+    await remember_origin_message(state, m)
     await state.set_state(EditAssetFSM.choose_asset)
     await m.answer(
         "Выбери актив:\n"
