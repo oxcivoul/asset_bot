@@ -2448,21 +2448,38 @@ async def on_edit_alerts(cb: CallbackQuery, state: FSMContext):
 # ------- delete -------
 @router.message(F.text == "🗑 Удалить актив")
 async def on_delete_menu(m: Message, state: FSMContext):
+    await safe_delete(m)
     assets = await list_assets(m.from_user.id)
     if not assets:
-        return await m.answer("Активов пока нет — удалять нечего.", reply_markup=main_menu_kb())
+        return await m.answer(
+            "Активов пока нет — удалять нечего.",
+            reply_markup=back_to_menu_inline()
+        )
 
     await state.clear()
     await remember_origin_message(state, m)
-    await m.answer("Выбери актив для удаления:", reply_markup=assets_list_kb(assets, "del"))
+    await send_step_prompt(
+        m, state,
+        "Выбери актив для удаления:",
+        reply_markup=assets_list_kb(assets, "del")
+    )
 
 @router.callback_query(F.data == "nav:delete")
-async def on_delete_menu_cb(cb: CallbackQuery):
+async def on_delete_menu_cb(cb: CallbackQuery, state: FSMContext):
     assets = await list_assets(cb.from_user.id)
     if not assets:
-        await cb.message.answer("Активов пока нет — удалять нечего.", reply_markup=main_menu_kb())
+        await cb.message.answer(
+            "Активов пока нет — удалять нечего.",
+            reply_markup=back_to_menu_inline()
+        )
         return await cb.answer()
-    await cb.message.answer("Выбери актив для удаления:", reply_markup=assets_list_kb(assets, "del"))
+
+    await safe_delete(cb.message)
+    await send_step_prompt(
+        cb.message, state,
+        "Выбери актив для удаления:",
+        reply_markup=assets_list_kb(assets, "del")
+    )
     await cb.answer()
 
 @router.callback_query(F.data.startswith("del:page:"))
@@ -2488,29 +2505,39 @@ async def on_delete_noop(cb: CallbackQuery):
     await cb.answer("Это крайняя страница")
 
 @router.callback_query(F.data.startswith("del:asset:"))
-async def on_delete_asset(cb: CallbackQuery):
+async def on_delete_asset(cb: CallbackQuery, state: FSMContext):
     asset_id = int(cb.data.split("del:asset:", 1)[1])
     a = await get_asset(cb.from_user.id, asset_id)
     if not a:
         return await cb.answer("Актив не найден")
 
     await delete_asset_row(cb.from_user.id, asset_id)
+
+    await drop_last_prompt(state, cb.bot)
+    await safe_delete(cb.message)
+
     await cb.message.answer(f"Удалил {safe_symbol(a['symbol'])} ✅", reply_markup=main_menu_kb())
     await cb.answer("Удалено")
 
 # ------- edit -------
 @router.message(F.text == "✏️ Редактировать список активов")
 async def on_edit_menu(m: Message, state: FSMContext):
+    await safe_delete(m)
+
     assets = await list_assets(m.from_user.id)
     if not assets:
-        return await m.answer("Активов пока нет — редактировать нечего.", reply_markup=main_menu_kb())
+        return await m.answer(
+            "Активов пока нет — редактировать нечего.",
+            reply_markup=back_to_menu_inline()
+        )
 
     await state.clear()
     await remember_origin_message(state, m)
     await state.set_state(EditAssetFSM.choose_asset)
-    await m.answer(
-        "Выбери актив:\n"
-        "✏️ — редактировать, 🗑 — удалить",
+
+    await send_step_prompt(
+        m, state,
+        "Выбери актив:\n✏️ — редактировать, 🗑 — удалить",
         reply_markup=assets_edit_list_kb(assets)
     )
 
@@ -2518,13 +2545,19 @@ async def on_edit_menu(m: Message, state: FSMContext):
 async def on_edit_menu_cb(cb: CallbackQuery, state: FSMContext):
     assets = await list_assets(cb.from_user.id)
     if not assets:
-        await cb.message.answer("Активов пока нет — редактировать нечего.", reply_markup=main_menu_kb())
+        await cb.message.answer(
+            "Активов пока нет — редактировать нечего.",
+            reply_markup=back_to_menu_inline()
+        )
         return await cb.answer()
+
     await state.clear()
     await state.set_state(EditAssetFSM.choose_asset)
-    await cb.message.answer(
-        "Выбери актив:\n"
-        "✏️ — редактировать, 🗑 — удалить",
+
+    await safe_delete(cb.message)
+    await send_step_prompt(
+        cb.message, state,
+        "Выбери актив:\n✏️ — редактировать, 🗑 — удалить",
         reply_markup=assets_edit_list_kb(assets)
     )
     await cb.answer()
@@ -2569,8 +2602,12 @@ async def on_edit_delete_asset(cb: CallbackQuery, state: FSMContext):
 
     await delete_asset_row(cb.from_user.id, asset_id)
 
+    await drop_last_prompt(state, cb.bot)
+    await safe_delete(cb.message)
+
     assets = await list_assets(cb.from_user.id)
     removed_sym = safe_symbol(a['symbol'])
+
     if not assets:
         await state.clear()
         await cb.message.answer(f"Удалил {removed_sym} ✅\nАктивов больше нет.", reply_markup=main_menu_kb())
@@ -2579,7 +2616,8 @@ async def on_edit_delete_asset(cb: CallbackQuery, state: FSMContext):
 
     await state.clear()
     await state.set_state(EditAssetFSM.choose_asset)
-    await cb.message.answer(
+    await send_step_prompt(
+        cb.message, state,
         f"Удалил {removed_sym} ✅\n\nВыбери следующий актив:",
         reply_markup=assets_edit_list_kb(assets)
     )
@@ -2596,47 +2634,75 @@ async def on_edit_choose(cb: CallbackQuery, state: FSMContext):
 
     await state.update_data(asset_id=asset_id)
     await state.set_state(EditAssetFSM.invested)
+
     ssym = safe_symbol(a['symbol'])
     sname = safe_name(a['name'] or "")
-    await cb.message.answer(
-        "\n".join([
-            f"Редактируем {ssym} ({sname})",
-            f"Текущая сумма: {fmt_usd(a['invested_usd'])}",
-            f"Текущая цена входа: {fmt_usd(a['entry_price'])}",
-            "",
-            "Введи новую сумму (USD). Можно 0 для бесплатной позиции:"
-        ]),
-        reply_markup=edit_actions_kb(asset_id)
-    )
+    text = "\n".join([
+        f"Редактируем {ssym} ({sname})",
+        f"Текущая сумма: {fmt_usd(a['invested_usd'])}",
+        f"Текущая цена входа: {fmt_usd(a['entry_price'])}",
+        "",
+        "Введи новую сумму (USD). Можно 0 для бесплатной позиции:"
+    ])
+
+    await safe_delete(cb.message)
+    await send_step_prompt(cb.message, state, text, reply_markup=edit_actions_kb(asset_id))
     await cb.answer()
 
 @router.message(EditAssetFSM.invested)
 async def on_edit_invested(m: Message, state: FSMContext):
+    await safe_delete(m)
+
+    data = await state.get_data()
+    asset_id = int(data["asset_id"])
+
     v = safe_float(m.text or "")
     if v is None or v < 0:
-        return await m.answer("Сумма не может быть отрицательной. Можно 0 для бесплатной позиции.")
+        await send_step_prompt(
+            m, state,
+            "Сумма не может быть отрицательной. Можно 0 для бесплатной позиции.",
+            reply_markup=edit_actions_kb(asset_id)
+        )
+        return
+
     await state.update_data(invested=float(v))
     await state.set_state(EditAssetFSM.entry)
-    await m.answer("Введи новую цену входа (USD). Можно 0, если хочешь ввести количество вручную:")
+    await send_step_prompt(
+        m, state,
+        "Введи новую цену входа (USD). Можно 0, если хочешь ввести количество вручную:",
+        reply_markup=edit_actions_kb(asset_id)
+    )
 
 @router.message(EditAssetFSM.entry)
 async def on_edit_entry(m: Message, state: FSMContext):
-    v = safe_float(m.text or "")
-    if v is None or v < 0:
-        return await m.answer("Цена не может быть отрицательной.")
+    await safe_delete(m)
 
-    entry = float(v)
     data = await state.get_data()
     asset_id = int(data["asset_id"])
     invested = float(data.get("invested", 0.0))
 
+    v = safe_float(m.text or "")
+    if v is None or v < 0:
+        await send_step_prompt(
+            m, state,
+            "Цена не может быть отрицательной.",
+            reply_markup=edit_actions_kb(asset_id)
+        )
+        return
+
+    entry = float(v)
     await state.update_data(entry=entry)
 
-    # Если qty нельзя адекватно посчитать как invested/entry — просим количество
     if invested == 0 or entry == 0:
         await state.set_state(EditAssetFSM.quantity)
-        return await m.answer("Введи количество монет для позиции (например 12.34):")
+        await send_step_prompt(
+            m, state,
+            "Введи количество монет для позиции (например 12.34):",
+            reply_markup=edit_actions_kb(asset_id)
+        )
+        return
 
+    await drop_last_prompt(state, m.bot)
     await update_asset_row(m.from_user.id, asset_id, invested, entry, qty_override=None)
     await recompute_alert_targets(asset_id, entry)
     await state.clear()
@@ -2644,15 +2710,23 @@ async def on_edit_entry(m: Message, state: FSMContext):
 
 @router.message(EditAssetFSM.quantity)
 async def on_edit_quantity(m: Message, state: FSMContext):
-    qty = safe_float(m.text or "")
-    if qty is None or qty <= 0:
-        return await m.answer("Количество должно быть больше нуля.")
+    await safe_delete(m)
 
     data = await state.get_data()
     asset_id = int(data["asset_id"])
     invested = float(data["invested"])
     entry = float(data["entry"])
 
+    qty = safe_float(m.text or "")
+    if qty is None or qty <= 0:
+        await send_step_prompt(
+            m, state,
+            "Количество должно быть больше нуля.",
+            reply_markup=edit_actions_kb(asset_id)
+        )
+        return
+
+    await drop_last_prompt(state, m.bot)
     await update_asset_row(m.from_user.id, asset_id, invested, entry, qty_override=float(qty))
     await recompute_alert_targets(asset_id, entry)
     await state.clear()
