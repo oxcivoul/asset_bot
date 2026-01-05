@@ -1079,7 +1079,7 @@ async def db_fetchall(sql: str, params: tuple = ()):
 
 async def delete_all_user_data(user_id: int):
     await db_exec("DELETE FROM assets WHERE user_id=$1", (user_id,))
-    await invalidate_summary_cache(user_id)
+    await db_exec("DELETE FROM users WHERE user_id=$1", (user_id,))
 
 def reset_confirm_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1858,8 +1858,10 @@ async def on_reset(m: Message):
 
 @router.callback_query(F.data == "reset:yes")
 async def on_reset_yes(cb: CallbackQuery, state: FSMContext):
+    await drop_last_prompt(state, cb.bot)
     await state.clear()
     await delete_all_user_data(cb.from_user.id)
+    await safe_delete(cb.message)
     await cb.answer("Данные удалены ✅", show_alert=True)
     await send_menu(cb.bot, cb.message.chat.id)
 
