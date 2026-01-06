@@ -510,7 +510,7 @@ class CoinGeckoClient:
         # NEW: limiter (simple spacing between requests)
         self._rl_lock = asyncio.Lock()
         self._last_request_ts = 0.0
-        self._min_interval_sec = float(os.getenv("COINGECKO_MIN_INTERVAL_SEC", "1.2"))
+        self._min_interval_sec = float(os.getenv("COINGECKO_MIN_INTERVAL_SEC", "2.0"))
         # 1.2 c ≈ 50 запросов/мин — соответствует лимиту free-tier без 429
 
         # NEW: adaptive backoff (when CoinGecko returns 429)
