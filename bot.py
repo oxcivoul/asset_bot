@@ -94,8 +94,10 @@ if DB_BACKEND == "postgres" and not DATABASE_URL:
 RISK_LEVELS = [5, 10, 25]
 TP_LEVELS = [5, 10, 25]
 ALERT_REARM_PCT = float(os.getenv("ALERT_REARM_PCT", "0.3"))
-# 0.3% = небольшой запас, чтобы алерт не “дребезжал” туда-сюда вокруг target
 ALERT_REARM_FACTOR = max(0.0, ALERT_REARM_PCT / 100.0)
+
+ALERT_LOOP_INTERVAL_SEC = float(os.getenv("ALERT_LOOP_INTERVAL_SEC", "10"))
+ALERT_PRICE_FRESH_SEC = float(os.getenv("ALERT_PRICE_FRESH_SEC", "30"))
 VERSION = "1.3.0"
 
 async def run_health_server():
@@ -2745,60 +2747,58 @@ async def price_feed_loop():
 
 async def alerts_loop():
     while True:
+        loop_started = time.perf_counter()
         try:
             rows = await pending_alerts_joined()
             if not rows:
-                await asyncio.sleep(PRICE_POLL_SECONDS + random.uniform(0, 5))
                 continue
 
-            ids = tuple(sorted({r["coingecko_id"] for r in rows if r.get("coingecko_id")}))
+            ids = sorted({r["coingecko_id"] for r in rows if r.get("coingecko_id")})
             if not ids:
-                await asyncio.sleep(PRICE_POLL_SECONDS + random.uniform(0, 5))
                 continue
 
-            price_map, missing = await price_feed_get(list(ids), max_age=ALERT_PRICE_CACHE_SEC)
+            price_map, missing = await price_feed_get(ids, max_age=ALERT_PRICE_FRESH_SEC)
+            missing_set: Set[str] = set(missing)
 
-            if missing:
-                await asyncio.sleep(1.0)
-                price_map_retry, missing_retry = await price_feed_get(
-                    list(ids),
-                    max_age=ALERT_PRICE_CACHE_SEC
-                )
-                price_map = price_map_retry
-                missing = missing_retry
+            now = time.time()
+            direct_candidates = [
+                cid for cid in missing_set
+                if (now - price_direct_last_fetch.get(cid, 0.0)) >= max(5.0, ALERT_LOOP_INTERVAL_SEC)
+            ]
 
-            if missing:
-                now = time.time()
-                to_fetch = [
-                    cid for cid in missing
-                    if (now - price_direct_last_fetch.get(cid, 0)) >= ALERT_PRICE_CACHE_SEC
-                ]
-
-                if to_fetch:
+            if direct_candidates:
+                try:
                     fresh = await cg.simple_prices_usd(
-                        to_fetch,
-                        ttl_sec=ALERT_PRICE_CACHE_SEC
+                        direct_candidates,
+                        ttl_sec=int(ALERT_PRICE_FRESH_SEC),
+                        priority="user"
                     )
-                    await price_feed_store(fresh)
-                    price_map.update(fresh)
-
-                    fetch_ts = time.time()
-                    for cid in fresh:
-                        price_direct_last_fetch[cid] = fetch_ts
-
-                    missing = [cid for cid in missing if cid not in fresh]
-
-                if missing:
-                    log.debug(
-                        "alerts_loop: waiting for price feed refresh (missing: %s)",
-                        ", ".join(missing)
+                except Exception as e:
+                    log.warning(
+                        "alerts_loop: direct fetch failed for %d ids: %r",
+                        len(direct_candidates),
+                        e
                     )
-                    await asyncio.sleep(1.0)
-                    continue
+                else:
+                    if fresh:
+                        await price_feed_store(fresh)
+                        fetched_at = time.time()
+                        for cid in fresh:
+                            price_direct_last_fetch[cid] = fetched_at
+                        price_map.update(fresh)
+                        missing_set.difference_update(fresh.keys())
 
-            await price_feed_store(price_map)
+            if missing_set:
+                log.debug(
+                    "alerts_loop: waiting for fresh prices %s",
+                    ", ".join(sorted(missing_set))
+                )
+                continue
+
             for r in rows:
                 cid = r.get("coingecko_id")
+                if not cid:
+                    continue
 
                 current_price = price_map.get(cid)
                 if current_price is None:
@@ -2828,68 +2828,71 @@ async def alerts_loop():
                             await set_alert_rearm_ready(alert_id, True)
                         continue
 
-                if not triggered:
-                    should_fire = (
-                        (alert_type == "RISK" and cur <= target) or
-                        (alert_type == "TP"   and cur >= target)
+                should_fire = (
+                    (alert_type == "RISK" and cur <= target) or
+                    (alert_type == "TP" and cur >= target)
+                )
+                if not should_fire:
+                    continue
+
+                qty_override = float(r.get("qty_override") or 0.0)
+                invested = float(r["invested_usd"])
+                entry = float(r["entry_price"])
+
+                if qty_override > 0:
+                    qty = qty_override
+                elif entry > 0 and invested > 0:
+                    qty = invested / entry
+                else:
+                    qty = 0.0
+                if qty == 0:
+                    continue
+
+                base_invested = invested if invested > 0 else qty * entry
+                pnl_usd = qty * cur - base_invested
+                pnl_pct = None if base_invested == 0 else pnl_usd / base_invested * 100.0
+                pct_text = "—" if pnl_pct is None else sign_pct(pnl_pct)
+
+                icon = "🔴" if alert_type == "RISK" else "🟢"
+                verb = "снизилась" if alert_type == "RISK" else "выросла"
+
+                if entry > 0:
+                    entry_delta_pct = (cur - entry) / entry * 100.0
+                    delta_line = f"Δ от входа: {sign_pct(entry_delta_pct)}"
+                else:
+                    approx_delta = float(pct if alert_type == "TP" else -pct)
+                    delta_line = f"Δ от входа: {sign_pct(approx_delta)}"
+
+                text = "\n".join([
+                    f"<b>🔔 АЛЕРТ: {escape(r['symbol'] or '')}</b>",
+                    f"{icon} Цена {verb} на {pct}% (уровень {fmt_price(target)})",
+                    delta_line,
+                    f"Текущая цена: {fmt_price(cur)}",
+                    f"{pnl_icon(pnl_usd)} PNL сейчас: {sign_money(pnl_usd)} ({pct_text})",
+                ])
+
+                queued = await queue_text_message(int(r["user_id"]), text, urgent=True)
+                if not queued:
+                    log.error(
+                        "alerts_loop: drop alert_id=%s for chat_id=%s (send queue saturated)",
+                        alert_id,
+                        r["user_id"]
                     )
-                    if not should_fire:
-                        continue
+                    continue
 
-                    qty_override = float(r.get("qty_override") or 0.0)
-                    invested = float(r["invested_usd"])
-                    entry = float(r["entry_price"])
-
-                    if qty_override > 0:
-                        qty = qty_override
-                    elif entry > 0 and invested > 0:
-                        qty = invested / entry
-                    else:
-                        qty = 0.0
-                    if qty == 0:
-                        continue
-
-                    base_invested = invested if invested > 0 else qty * entry
-                    pnl_usd = qty * cur - base_invested
-                    pnl_pct = None if base_invested == 0 else pnl_usd / base_invested * 100.0
-                    pct_text = "—" if pnl_pct is None else sign_pct(pnl_pct)
-
-                    icon = "🔴" if alert_type == "RISK" else "🟢"
-                    verb = "снизилась" if alert_type == "RISK" else "выросла"
-
-                    if entry > 0:
-                        entry_delta_pct = (cur - entry) / entry * 100.0
-                        delta_line = f"Δ от входа: {sign_pct(entry_delta_pct)}"
-                    else:
-                        approx_delta = float(pct if alert_type == "TP" else -pct)
-                        delta_line = f"Δ от входа: {sign_pct(approx_delta)}"
-
-                    text = "\n".join([
-                        f"<b>🔔 АЛЕРТ: {escape(r['symbol'] or '')}</b>",
-                        f"{icon} Цена {verb} на {pct}% (уровень {fmt_price(target)})",
-                        delta_line,
-                        f"Текущая цена: {fmt_price(cur)}",
-                        f"{pnl_icon(pnl_usd)} PNL сейчас: {sign_money(pnl_usd)} ({pct_text})",
-                    ])
-                    queued = await queue_text_message(int(r["user_id"]), text, urgent=True)
-                    if not queued:
-                        log.error(
-                            "alerts_loop: drop alert_id=%s for chat_id=%s (send queue saturated)",
-                            alert_id,
-                            r["user_id"]
-                        )
-                        continue
-                    await mark_alert_triggered(alert_id)
+                await mark_alert_triggered(alert_id)
 
         except asyncio.CancelledError:
             break
         except Exception as e:
             log.exception("alerts_loop error: %r", e)
-
-        try:
-            await asyncio.sleep(PRICE_POLL_SECONDS + random.uniform(0, 5))
-        except asyncio.CancelledError:
-            break
+        finally:
+            delay = ALERT_LOOP_INTERVAL_SEC - (time.perf_counter() - loop_started)
+            if delay > 0:
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    break
 
 # ---------------------------- main ----------------------------
 async def main():
