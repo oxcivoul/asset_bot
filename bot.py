@@ -492,65 +492,75 @@ def safe_float(text: str) -> Optional[float]:
         return None
 
 class CoinGeckoClient:
-    BASE = os.getenv("COINGECKO_BASE", "https://api.coingecko.com/api/v3").strip()
-
     def __init__(self):
         self._session: Optional[aiohttp.ClientSession] = None
 
-        # NEW: cache per-id (price)
+        # price/search caches
         self._price_cache_id: Dict[str, Tuple[float, float]] = {}
         self._price_cache_max_age = PRICE_CACHE_MAX_AGE_SEC
         self._search_cache_max_age = SEARCH_CACHE_MAX_AGE_SEC
         self._search_cache_max_size = SEARCH_CACHE_MAX_SIZE
-
-        # NEW: cache for search(query)
         self._search_cache: Dict[str, Tuple[float, List[dict]]] = {}
-        # cache для simple_prices_usd (ключ — отсортированный список id)
         self._simple_price_cache: Dict[str, Dict[str, Any]] = {}
 
-        # NEW: limiter (min interval + token bucket)
+        # rate limiting
         self._rl_lock = asyncio.Lock()
         self._last_request_ts = 0.0
         self._min_interval_sec = float(os.getenv("COINGECKO_MIN_INTERVAL_SEC", "2.0"))
         self._request_log = deque()
         self._max_calls_per_min = int(os.getenv("COINGECKO_CALLS_PER_MIN", "25"))
-
-        # NEW: adaptive backoff (when CoinGecko returns 429)
         self._base_min_interval_sec = self._min_interval_sec
         self._penalty_until_ts = 0.0
         self._penalty_min_interval_sec = self._min_interval_sec
 
-        # stats
-        self._stats_calls = 0
-        self._stats_time = 0.0
-        self._stats_429 = 0
-
-        # NEW: ограничиваем параллельность HTTP (но не «затыкаем» её в 1 поток)
+        # concurrency limits
         self._max_parallel_http = max(1, int(os.getenv("COINGECKO_MAX_PARALLEL", "3")))
-
         default_user_parallel = min(2, self._max_parallel_http)
         self._max_parallel_user = max(
             1,
             int(os.getenv("COINGECKO_MAX_PARALLEL_USER", str(default_user_parallel)))
         )
-
         default_bg_parallel = max(1, self._max_parallel_http - self._max_parallel_user)
         self._max_parallel_bg = max(
             1,
             int(os.getenv("COINGECKO_MAX_PARALLEL_BG", str(default_bg_parallel)))
         )
-
         self._user_sem = asyncio.Semaphore(self._max_parallel_user)
         self._bg_sem = asyncio.Semaphore(self._max_parallel_bg)
 
+        # API key / tier / base URL / param name
         self._api_key = os.getenv("COINGECKO_API_KEY", "").strip()
+        self._api_tier = os.getenv("COINGECKO_API_TIER", "").strip().lower()
+        forced_base = os.getenv("COINGECKO_BASE", "").strip()
+
+        if self._api_tier not in ("demo", "pro"):
+            if self._api_key.upper().startswith("CG-PRO"):
+                self._api_tier = "pro"
+            else:
+                self._api_tier = "demo"
+
+        if forced_base:
+            self.BASE = forced_base
+            self._api_param_name = (
+                "x_cg_pro_api_key" if self._api_tier == "pro" else "x_cg_demo_api_key"
+            )
+        elif self._api_tier == "pro":
+            self.BASE = "https://pro-api.coingecko.com/api/v3"
+            self._api_param_name = "x_cg_pro_api_key"
+        else:
+            self.BASE = "https://api.coingecko.com/api/v3"
+            self._api_param_name = "x_cg_demo_api_key"
+
+        # static headers (без ключей — они теперь в query)
         self._headers = {
             "User-Agent": "asset-accountant-bot/1.0 (+https://github.com/your/repo)",
             "Accept": "application/json",
         }
-        if self._api_key:
-            self._headers["x-cg-demo-api-key"] = self._api_key
-            self._headers["x-cg-pro-api-key"] = self._api_key
+
+        # stats
+        self._stats_calls = 0
+        self._stats_time = 0.0
+        self._stats_429 = 0
 
     async def session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -628,12 +638,16 @@ class CoinGeckoClient:
     async def _get_json(
         self,
         path: str,
-        params: Dict[str, str],
+        params: Optional[Dict[str, str]] = None,
         *,
         tries: int = 5,
         priority: str = "bg",
     ) -> dict:
         url = f"{self.BASE}{path}"
+        params = params.copy() if params else {}
+        if self._api_key:
+            params[self._api_param_name] = self._api_key
+
         backoff = 1.0
         last_exc: Optional[BaseException] = None
         sem = self._user_sem if priority == "user" else self._bg_sem
