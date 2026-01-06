@@ -6,6 +6,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple, Set, Any
+from collections import deque
 from html import escape  # понадобится в алертах
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -507,17 +508,18 @@ class CoinGeckoClient:
         # cache для simple_prices_usd (ключ — отсортированный список id)
         self._simple_price_cache: Dict[str, Dict[str, Any]] = {}
 
-        # NEW: limiter (simple spacing between requests)
+        # NEW: limiter (min interval + token bucket)
         self._rl_lock = asyncio.Lock()
         self._last_request_ts = 0.0
         self._min_interval_sec = float(os.getenv("COINGECKO_MIN_INTERVAL_SEC", "2.0"))
-        # 1.2 c ≈ 50 запросов/мин — соответствует лимиту free-tier без 429
+        self._request_log = deque()
+        self._max_calls_per_min = int(os.getenv("COINGECKO_CALLS_PER_MIN", "25"))
 
         # NEW: adaptive backoff (when CoinGecko returns 429)
         self._base_min_interval_sec = self._min_interval_sec
         self._penalty_until_ts = 0.0
         self._penalty_min_interval_sec = self._min_interval_sec
-        self._penalty_ttl_sec = 0  # больше не увеличиваем TTL кэша в штрафе
+
         # stats
         self._stats_calls = 0
         self._stats_time = 0.0
@@ -563,19 +565,10 @@ class CoinGeckoClient:
             await self._session.close()
 
     def _enable_penalty(self, *, retry_after: float):
-        # Понижаем агрессивно, но без раздувания TTL
         now = time.time()
-        window = max(90.0, retry_after, 0.0)
-        self._penalty_until_ts = max(self._penalty_until_ts, now + window)
-
-        # min interval: чуть подрастить, но не выше 1.6s
-        self._penalty_min_interval_sec = min(
-            max(self._penalty_min_interval_sec * 1.3, self._min_interval_sec),
-            1.6
-        )
-
-        # не трогаем TTL кэша
-        self._penalty_ttl_sec = 0
+        pause = max(retry_after, 30.0)
+        self._penalty_until_ts = max(self._penalty_until_ts, now + pause)
+        self._penalty_min_interval_sec = max(self._penalty_min_interval_sec, self._min_interval_sec)
 
     def purge_caches(self):
         now = time.time()
@@ -597,24 +590,40 @@ class CoinGeckoClient:
                 self._search_cache.pop(key, None)
 
     async def _rate_limit_wait(self):
-        # simple global pacing between requests (+ adaptive penalty on 429)
         async with self._rl_lock:
             now = time.time()
-            in_penalty = now < self._penalty_until_ts
-            interval = self._penalty_min_interval_sec if in_penalty else self._min_interval_sec
 
+            # 1) глобальный лимит в X запросов за 60 секунд
+            cutoff = now - 60.0
+            while self._request_log and self._request_log[0] < cutoff:
+                self._request_log.popleft()
+            while len(self._request_log) >= self._max_calls_per_min:
+                wait = self._request_log[0] + 60.0 - now
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                now = time.time()
+                while self._request_log and self._request_log[0] < now - 60.0:
+                    self._request_log.popleft()
+
+            # 2) уважение Retry-After
+            if now < self._penalty_until_ts:
+                await asyncio.sleep(self._penalty_until_ts - now)
+                now = time.time()
+
+            # 3) минимальный интервал между запросами
+            interval = self._penalty_min_interval_sec if now < self._penalty_until_ts else self._min_interval_sec
             wait = (self._last_request_ts + interval) - now
             if wait > 0:
                 await asyncio.sleep(wait)
-            self._last_request_ts = time.time()
 
-            # decay penalty when window ends
-            if not in_penalty:
+            self._last_request_ts = time.time()
+            self._request_log.append(self._last_request_ts)
+
+            if self._last_request_ts >= self._penalty_until_ts:
                 self._penalty_min_interval_sec = max(
                     self._base_min_interval_sec,
                     self._penalty_min_interval_sec * 0.9
                 )
-                self._penalty_ttl_sec = int(self._penalty_ttl_sec * 0.9)
 
     async def _get_json(
         self,
