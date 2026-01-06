@@ -70,6 +70,17 @@ PRICE_TTL_SEC = int(os.getenv("PRICE_TTL_SEC", "180"))
 SUMMARY_CACHE_TTL_SEC = int(os.getenv("SUMMARY_CACHE_TTL_SEC", str(PRICE_TTL_SEC)))
 SUMMARY_PAGE_CHAR_LIMIT = int(os.getenv("SUMMARY_PAGE_CHAR_LIMIT", "3900"))
 ASSET_LIST_PAGE_SIZE = int(os.getenv("ASSET_LIST_PAGE_SIZE", "10"))
+SUMMARY_REFRESH_FAST_TIMEOUT_SEC = int(os.getenv("SUMMARY_REFRESH_FAST_TIMEOUT_SEC", "10"))
+SUMMARY_REFRESH_HARD_TIMEOUT_SEC = int(os.getenv("SUMMARY_REFRESH_HARD_TIMEOUT_SEC", "30"))
+SUMMARY_REFRESH_HARD_TIMEOUT_SEC = max(SUMMARY_REFRESH_HARD_TIMEOUT_SEC, SUMMARY_REFRESH_FAST_TIMEOUT_SEC)
+SUMMARY_STALE_CACHE_NOTICE = os.getenv(
+    "SUMMARY_STALE_CACHE_NOTICE",
+    "⚠️ CoinGecko не ответил вовремя — показываю данные из кэша (данные устарели)."
+).strip()
+SUMMARY_REFRESH_RECOVERED_NOTICE = os.getenv(
+    "SUMMARY_REFRESH_RECOVERED_NOTICE",
+    "✅ Получил свежие данные — сводка обновлена."
+).strip()
 DEFAULT_ALERT_PRICE_CACHE = max(PRICE_POLL_SECONDS + 5, PRICE_TTL_SEC)
 ALERT_PRICE_CACHE_SEC = int(os.getenv("ALERT_PRICE_CACHE_SEC", str(DEFAULT_ALERT_PRICE_CACHE)))
 ALERT_RECENT_RESET_SECONDS = int(os.getenv("ALERT_RECENT_RESET_SECONDS", "3600"))
@@ -349,6 +360,22 @@ def summary_kb(page: int, total_pages: int) -> InlineKeyboardMarkup:
     rows.append(back_to_menu_row())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+def clamp_summary_page(page: int, total_pages: int) -> int:
+    if total_pages <= 0:
+        return 0
+    return max(0, min(page, total_pages - 1))
+
+async def edit_summary_message(cb: CallbackQuery, pages: List[str], page: int):
+    total_pages = len(pages) or 1
+    page = clamp_summary_page(page, total_pages)
+    try:
+        await cb.message.edit_text(pages[page], reply_markup=summary_kb(page, total_pages))
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            await cb.answer("У тебя уже самая свежая версия 👍")
+            return
+        raise
+
 def fmt_usd(x: float) -> str:
     return f"{x:,.2f}"
 
@@ -430,6 +457,15 @@ def prepend_warning_to_pages(
         safe_pages.extend(_split_html_block(chunk, limit))
 
     return safe_pages or [warning]
+
+def apply_summary_warnings(pages: List[str], *warnings: Optional[str]) -> List[str]:
+    payload = "\n\n".join([
+        w.strip() for w in warnings
+        if w and w.strip()
+    ])
+    if not payload:
+        return pages
+    return prepend_warning_to_pages(pages, payload)
 
 def safe_symbol(sym: str) -> str:
     return escape(sym or "")
@@ -1876,38 +1912,95 @@ async def on_summary_refresh(cb: CallbackQuery):
     except Exception:
         page = 0
 
-    row = await db_fetchone(
-        "SELECT last_summary_cached_at FROM users WHERE user_id=$1",
-        (cb.from_user.id,)
-    )
-    last_ts = float(row["last_summary_cached_at"]) if row and row.get("last_summary_cached_at") else None
+    user_id = cb.from_user.id
     now = time.time()
 
-    use_cache = last_ts is not None and (now - last_ts) < SUMMARY_CACHE_TTL_SEC
-    if use_cache:
-        wait_left = int(SUMMARY_CACHE_TTL_SEC - (now - last_ts))
-        await cb.answer(f"Показываю кэш. Новые цены через ~{max(wait_left, 0)} s")
-    else:
-        await cb.answer("Запрашиваю свежие цены CoinGecko…")
+    row = await db_fetchone(
+        "SELECT last_summary_cached_at FROM users WHERE user_id=$1",
+        (user_id,)
+    )
+    last_ts = float(row["last_summary_cached_at"]) if row and row.get("last_summary_cached_at") else None
+    age = (now - last_ts) if last_ts else None
 
-    pages, warning = await get_summary_pages_safe(cb.from_user.id, force_refresh=not use_cache)
+    if age is not None and age < SUMMARY_CACHE_TTL_SEC:
+        wait_left = int(SUMMARY_CACHE_TTL_SEC - age)
+        cached_pages, cached_warning = await get_summary_pages_safe(user_id, force_refresh=False)
+        if cached_pages is None:
+            await cb.message.answer(cached_warning or "⚠️ CoinGecko недоступен. Попробуй позже.")
+            await cb.answer("Не удалось показать кэш")
+            return
+
+        cooldown_notice = f"♻️ Показан кэш, новые цены через ~{wait_left} с."
+        cached_pages = apply_summary_warnings(cached_pages, cooldown_notice, cached_warning)
+        await edit_summary_message(cb, cached_pages, page)
+        await cb.answer("Кэш ещё свежий — запрос не отправляю.")
+        return
+
+    fast_timeout = SUMMARY_REFRESH_FAST_TIMEOUT_SEC
+    hard_timeout = SUMMARY_REFRESH_HARD_TIMEOUT_SEC
+    late_timeout = max(0, hard_timeout - fast_timeout)
+
+    fresh_task = asyncio.create_task(get_summary_pages_safe(user_id, force_refresh=True))
+    stale_rendered = False
+
+    await cb.answer("Запрашиваю свежие цены CoinGecko…")
+
+    try:
+        pages, warning = await asyncio.wait_for(fresh_task, timeout=fast_timeout)
+    except asyncio.TimeoutError:
+        stale_pages, stale_warning = await get_summary_pages_safe(user_id, force_refresh=False)
+        if stale_pages is not None:
+            stale_pages = apply_summary_warnings(
+                stale_pages,
+                SUMMARY_STALE_CACHE_NOTICE,
+                stale_warning
+            )
+            await edit_summary_message(cb, stale_pages, page)
+            stale_rendered = True
+        else:
+            await cb.message.answer(stale_warning or "⚠️ CoinGecko не отвечает и кэш пуст.")
+
+        if late_timeout <= 0:
+            return
+
+        try:
+            pages, warning = await asyncio.wait_for(fresh_task, timeout=late_timeout)
+        except asyncio.TimeoutError:
+            fresh_task.cancel()
+            if not stale_rendered:
+                await cb.message.answer("⚠️ CoinGecko не ответил за 30 с. Попробуй позже.")
+            return
+        except Exception as e:
+            log.exception("summary refresh (late) failed: %r", e)
+            if not stale_rendered:
+                await cb.message.answer(f"⚠️ CoinGecko вернул ошибку: {e}")
+            return
+    except Exception as e:
+        log.exception("summary refresh failed: %r", e)
+        fallback_pages, fallback_warning = await get_summary_pages_safe(user_id, force_refresh=False)
+        extra_warning = f"⚠️ CoinGecko вернул ошибку: {e}"
+        if fallback_pages is None:
+            await cb.message.answer(fallback_warning or extra_warning)
+            return
+        fallback_pages = apply_summary_warnings(
+            fallback_pages,
+            SUMMARY_STALE_CACHE_NOTICE,
+            extra_warning,
+            fallback_warning
+        )
+        await edit_summary_message(cb, fallback_pages, page)
+        return
+
     if pages is None:
         await cb.message.answer(warning or "⚠️ CoinGecko недоступен. Попробуй позже.")
         return
 
-    if warning:
-        pages = prepend_warning_to_pages(pages, warning)
+    final_warning = warning
+    if stale_rendered:
+        final_warning = "\n".join(filter(None, [SUMMARY_REFRESH_RECOVERED_NOTICE, warning]))
 
-    total_pages = len(pages)
-    page = max(0, min(page, total_pages - 1))
-
-    try:
-        await cb.message.edit_text(pages[page], reply_markup=summary_kb(page, total_pages))
-    except TelegramBadRequest as e:
-        if "message is not modified" in str(e):
-            await cb.answer("У тебя уже самая свежая версия 👍")
-            return
-        raise
+    pages = apply_summary_warnings(pages, final_warning)
+    await edit_summary_message(cb, pages, page)
 
 @router.callback_query(F.data.startswith("summary:page:"))
 async def on_summary_page(cb: CallbackQuery):
