@@ -283,6 +283,93 @@ async def safe_delete(message: Message):
     except TelegramBadRequest:
         pass
 
+
+async def purge_private_chat_history(
+    bot: Bot,
+    chat_id: int,
+    *,
+    last_message_id: Optional[int] = None,
+    throttle_every: int = 25,
+    throttle_delay: float = 0.05,
+    max_consecutive_failures: int = 20,
+) -> int:
+    """
+    Best-effort очистка приватного чата. Telegram не даёт удалять сообщения старше ~48 часов,
+    поэтому при массовых отказах просто выходим.
+    """
+    if last_message_id is None:
+        try:
+            probe = await bot.send_message(
+                chat_id,
+                "🧹 Чищу историю…",
+                disable_notification=True
+            )
+            last_message_id = probe.message_id
+            await bot.delete_message(chat_id, probe.message_id)
+        except Exception as e:
+            log.warning(
+                "purge_private_chat_history: probe failed chat_id=%s err=%r",
+                chat_id,
+                e
+            )
+            return 0
+
+    last_message_id = int(last_message_id or 0)
+    if last_message_id <= 0:
+        return 0
+
+    deleted = 0
+    failures = 0
+
+    for message_id in range(last_message_id, 0, -1):
+        try:
+            await bot.delete_message(chat_id, message_id)
+            deleted += 1
+            failures = 0
+            if throttle_every and deleted % throttle_every == 0:
+                await asyncio.sleep(throttle_delay)
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(float(e.retry_after) + random.uniform(0.05, 0.2))
+            continue
+        except TelegramBadRequest as e:
+            text = str(e).lower()
+            if any(
+                marker in text
+                for marker in (
+                    "message can't be deleted",
+                    "message to delete not found",
+                    "message can't be found",
+                    "message identifiers invalid",
+                )
+            ):
+                failures += 1
+                if ("can't be deleted" in text and failures >= 3) or failures >= max_consecutive_failures:
+                    break
+                continue
+            log.warning(
+                "purge_private_chat_history: bad request chat_id=%s mid=%s err=%s",
+                chat_id,
+                message_id,
+                e
+            )
+            failures += 1
+            if failures >= max_consecutive_failures:
+                break
+        except (TelegramForbiddenError, TelegramNotFound):
+            break
+        except Exception as e:
+            log.warning(
+                "purge_private_chat_history: error chat_id=%s mid=%s err=%r",
+                chat_id,
+                message_id,
+                e
+            )
+            failures += 1
+            if failures >= max_consecutive_failures:
+                break
+
+    return deleted
+
 PROMPT_CHAT_KEY = "last_prompt_chat_id"
 PROMPT_MSG_KEY = "last_prompt_message_id"
 
@@ -1884,11 +1971,39 @@ async def on_reset(m: Message):
 @router.callback_query(F.data == "reset:yes")
 async def on_reset_yes(cb: CallbackQuery, state: FSMContext):
     await drop_last_prompt(state, cb.bot)
+
+    chat_id = cb.message.chat.id if cb.message else cb.from_user.id
+    last_message_id = cb.message.message_id if cb.message else None
+
     await state.clear()
     await delete_all_user_data(cb.from_user.id)
-    await safe_delete(cb.message)
+
+    if cb.message:
+        await safe_delete(cb.message)
+
+    deleted_messages = 0
+    try:
+        deleted_messages = await purge_private_chat_history(
+            cb.bot,
+            chat_id,
+            last_message_id=last_message_id
+        )
+    except Exception:
+        log.exception(
+            "reset: purge failed chat_id=%s user_id=%s",
+            chat_id,
+            cb.from_user.id
+        )
+    else:
+        log.info(
+            "reset: wiped %d msgs chat_id=%s user_id=%s",
+            deleted_messages,
+            chat_id,
+            cb.from_user.id
+        )
+
     await cb.answer("Данные удалены ✅", show_alert=True)
-    await send_menu(cb.bot, cb.message.chat.id)
+    await send_menu(cb.bot, chat_id)
 
 @router.callback_query(F.data.startswith("summary:refresh"))
 async def on_summary_refresh(cb: CallbackQuery):
