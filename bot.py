@@ -290,6 +290,25 @@ async def safe_delete(message: Message):
         pass
 
 
+async def wipe_chat_history(bot: Bot, chat_id: int) -> bool:
+    """
+    Прямой вызов кнопки «Очистить историю сообщений». Возвращаем True,
+    если Telegram подтвердил очистку, иначе False.
+    """
+    try:
+        await bot.delete_chat_history(chat_id=chat_id, revoke=True)
+        return True
+    except AttributeError:
+        log.warning("Bot API не поддерживает delete_chat_history — переключаюсь на fallback.")
+    except TelegramBadRequest as e:
+        log.warning("delete_chat_history отклонён chat_id=%s err=%s", chat_id, e)
+    except TelegramForbiddenError:
+        log.warning("delete_chat_history: доступ запрещён chat_id=%s", chat_id)
+    except Exception:
+        log.exception("delete_chat_history: неожиданная ошибка chat_id=%s", chat_id)
+    return False
+
+
 async def purge_private_chat_history(
     bot: Bot,
     chat_id: int,
@@ -300,8 +319,8 @@ async def purge_private_chat_history(
     max_consecutive_failures: int = 20,
 ) -> int:
     """
-    Best-effort очистка приватного чата. Telegram не даёт удалять сообщения старше ~48 часов,
-    поэтому при массовых отказах просто выходим.
+    Резервный способ: удаляем сообщения по одному, пока Telegram разрешает
+    (обычно последние ~48 часов).
     """
     if last_message_id is None:
         try:
@@ -1987,29 +2006,33 @@ async def on_reset_yes(cb: CallbackQuery, state: FSMContext):
     if cb.message:
         await safe_delete(cb.message)
 
-    deleted_messages = 0
+    wiped = False
     try:
-        deleted_messages = await purge_private_chat_history(
-            cb.bot,
-            chat_id,
-            last_message_id=last_message_id
-        )
+        wiped = await wipe_chat_history(cb.bot, chat_id)
     except Exception:
-        log.exception(
-            "reset: purge failed chat_id=%s user_id=%s",
-            chat_id,
-            cb.from_user.id
-        )
-    else:
-        log.info(
-            "reset: wiped %d msgs chat_id=%s user_id=%s",
-            deleted_messages,
-            chat_id,
-            cb.from_user.id
-        )
+        log.exception("reset: delete_chat_history crashed chat_id=%s user_id=%s", chat_id, cb.from_user.id)
+
+    if not wiped:
+        try:
+            deleted_messages = await purge_private_chat_history(
+                cb.bot,
+                chat_id,
+                last_message_id=last_message_id
+            )
+            log.info(
+                "reset: fallback purge removed %d msgs chat_id=%s user_id=%s",
+                deleted_messages,
+                chat_id,
+                cb.from_user.id
+            )
+        except Exception:
+            log.exception(
+                "reset: purge fallback failed chat_id=%s user_id=%s",
+                chat_id,
+                cb.from_user.id
+            )
 
     await cb.answer("Данные удалены ✅", show_alert=True)
-    await send_menu(cb.bot, chat_id)
 
 @router.callback_query(F.data.startswith("summary:refresh"))
 async def on_summary_refresh(cb: CallbackQuery):
