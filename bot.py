@@ -97,8 +97,14 @@ TP_LEVELS = [5, 10, 25]
 ALERT_REARM_PCT = float(os.getenv("ALERT_REARM_PCT", "0.3"))
 ALERT_REARM_FACTOR = max(0.0, ALERT_REARM_PCT / 100.0)
 
-ALERT_LOOP_INTERVAL_SEC = float(os.getenv("ALERT_LOOP_INTERVAL_SEC", "10"))
-ALERT_PRICE_FRESH_SEC = float(os.getenv("ALERT_PRICE_FRESH_SEC", "30"))
+ALERT_LOOP_INTERVAL_SEC = float(os.getenv("ALERT_LOOP_INTERVAL_SEC", "60"))
+ALERT_PRICE_FRESH_SEC = float(os.getenv(
+    "ALERT_PRICE_FRESH_SEC",
+    str(max(PRICE_POLL_SECONDS, 75))
+))
+ALERT_DIRECT_FETCH_COOLDOWN_SEC = float(
+    os.getenv("ALERT_DIRECT_FETCH_COOLDOWN_SEC", "300")
+)
 VERSION = "1.3.0"
 
 async def run_health_server():
@@ -2899,9 +2905,10 @@ async def alerts_loop():
             missing_set: Set[str] = set(missing)
 
             now = time.time()
+            cooldown = ALERT_DIRECT_FETCH_COOLDOWN_SEC
             direct_candidates = [
                 cid for cid in missing_set
-                if (now - price_direct_last_fetch.get(cid, 0.0)) >= max(5.0, ALERT_LOOP_INTERVAL_SEC)
+                if (now - price_direct_last_fetch.get(cid, 0.0)) >= cooldown
             ]
 
             if direct_candidates:
