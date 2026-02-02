@@ -99,6 +99,10 @@ ASSET_IDS_CACHE_TTL_SEC = int(os.getenv("ASSET_IDS_CACHE_TTL_SEC", "600"))
 ALERT_QUERY_CACHE_SEC = int(os.getenv("ALERT_QUERY_CACHE_SEC", "30"))
 
 VERSION = "1.3.0"
+RISK_LEVELS = [5, 10, 25]
+TP_LEVELS = [5, 10, 25]
+ALERT_REARM_PCT = float(os.getenv("ALERT_REARM_PCT", "0.3"))
+ALERT_REARM_FACTOR = max(0.0, ALERT_REARM_PCT / 100.0)
 
 async def run_health_server():
     app = web.Application()
@@ -1899,6 +1903,11 @@ def alerts_kb(selected: Set[str]) -> InlineKeyboardMarkup:
     rows.append(back_to_menu_row())
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+def alert_dismiss_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧹 Удалить", callback_data="alert:dismiss")]
+    ])
+
 def assets_list_kb(assets_rows, prefix: str, page: int = 0) -> InlineKeyboardMarkup:
     page_size = ASSET_LIST_PAGE_SIZE
     total = len(assets_rows)
@@ -2813,6 +2822,15 @@ async def on_edit_choose(cb: CallbackQuery, state: FSMContext):
     await send_step_prompt(cb.message, state, text, reply_markup=edit_actions_kb(asset_id))
     await cb.answer()
 
+@router.callback_query(F.data == "alert:dismiss")
+async def on_alert_dismiss(cb: CallbackQuery):
+    try:
+        if cb.message:
+            await cb.message.delete()
+        await cb.answer("Удалил ✅")
+    except TelegramBadRequest:
+        await cb.answer("Сообщение уже исчезло", show_alert=True)
+
 @router.message(EditAssetFSM.invested)
 async def on_edit_invested(m: Message, state: FSMContext):
     await safe_delete(m)
@@ -3082,7 +3100,12 @@ async def alerts_loop():
                     f"{pnl_icon(pnl_usd)} PNL сейчас: {sign_money(pnl_usd)} ({pct_text})",
                 ])
 
-                queued = await queue_text_message(int(r["user_id"]), text, urgent=True)
+                queued = await queue_text_message(
+                    int(r["user_id"]),
+                    text,
+                    urgent=True,
+                    reply_markup=alert_dismiss_kb()
+                )        
                 if not queued:
                     log.error(
                         "alerts_loop: drop alert_id=%s for chat_id=%s (send queue saturated)",
