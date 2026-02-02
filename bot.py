@@ -64,10 +64,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 # DB (Postgres / Neon)
 DB_BACKEND = os.getenv("DB_BACKEND", "postgres").strip().lower()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-PG_POOL_SIZE = int(os.getenv("PG_POOL_SIZE", "5"))
+PG_POOL_SIZE = int(os.getenv("PG_POOL_SIZE", "1"))
 
-PRICE_POLL_SECONDS = int(os.getenv("PRICE_POLL_SECONDS", "60"))
-PRICE_TTL_SEC = int(os.getenv("PRICE_TTL_SEC", "180"))
+PRICE_POLL_SECONDS = int(os.getenv("PRICE_POLL_SECONDS", "300"))
+PRICE_TTL_SEC = int(os.getenv("PRICE_TTL_SEC", str(max(PRICE_POLL_SECONDS, 300))))
 SUMMARY_CACHE_TTL_SEC = int(os.getenv("SUMMARY_CACHE_TTL_SEC", str(PRICE_TTL_SEC)))
 SUMMARY_PAGE_CHAR_LIMIT = int(os.getenv("SUMMARY_PAGE_CHAR_LIMIT", "3900"))
 ASSET_LIST_PAGE_SIZE = int(os.getenv("ASSET_LIST_PAGE_SIZE", "10"))
@@ -86,25 +86,18 @@ SEND_QUEUE_PUT_TIMEOUT_SEC = float(os.getenv("SEND_QUEUE_PUT_TIMEOUT_SEC", "1.0"
 ALERT_SEND_QUEUE_MAXSIZE = int(os.getenv("ALERT_SEND_QUEUE_MAXSIZE", "200"))
 SEND_QUEUE_IDLE_RECHECK_SEC = float(os.getenv("SEND_QUEUE_IDLE_RECHECK_SEC", "0.25"))
 
-if not BOT_TOKEN:
-    raise RuntimeError("Missing BOT_TOKEN. Put it into your .env (BOT_TOKEN=...)")
-
-if DB_BACKEND == "postgres" and not DATABASE_URL:
-    raise RuntimeError("Missing DATABASE_URL (Neon). Set it in Render env.")
-
-RISK_LEVELS = [5, 10, 25]
-TP_LEVELS = [5, 10, 25]
-ALERT_REARM_PCT = float(os.getenv("ALERT_REARM_PCT", "0.3"))
-ALERT_REARM_FACTOR = max(0.0, ALERT_REARM_PCT / 100.0)
-
-ALERT_LOOP_INTERVAL_SEC = float(os.getenv("ALERT_LOOP_INTERVAL_SEC", "60"))
+ALERT_LOOP_INTERVAL_SEC = float(os.getenv("ALERT_LOOP_INTERVAL_SEC", "180"))
 ALERT_PRICE_FRESH_SEC = float(os.getenv(
     "ALERT_PRICE_FRESH_SEC",
-    str(max(PRICE_POLL_SECONDS, 75))
+    str(max(PRICE_POLL_SECONDS, 300))
 ))
 ALERT_DIRECT_FETCH_COOLDOWN_SEC = float(
-    os.getenv("ALERT_DIRECT_FETCH_COOLDOWN_SEC", "99999")
+    os.getenv("ALERT_DIRECT_FETCH_COOLDOWN_SEC", "900")
 )
+
+ASSET_IDS_CACHE_TTL_SEC = int(os.getenv("ASSET_IDS_CACHE_TTL_SEC", "600"))
+ALERT_QUERY_CACHE_SEC = int(os.getenv("ALERT_QUERY_CACHE_SEC", "30"))
+
 VERSION = "1.3.0"
 
 async def run_health_server():
@@ -920,6 +913,12 @@ cg = CoinGeckoClient()
 latest_prices: Dict[str, Tuple[float, float]] = {}
 latest_prices_lock = asyncio.Lock()
 price_direct_last_fetch: Dict[str, float] = {}
+asset_ids_cache: Set[str] = set()
+asset_ids_cache_ts: float = 0.0
+
+alert_rows_cache: List[dict] = []
+alert_rows_cache_ts: float = 0.0
+alert_rows_cache_dirty = True
 
 async def price_feed_store(new_map: Dict[str, float]):
     if not new_map:
@@ -1217,6 +1216,30 @@ async def db_fetchall(sql: str, params: tuple = ()):
 async def delete_all_user_data(user_id: int):
     await db_exec("DELETE FROM assets WHERE user_id=$1", (user_id,))
     await db_exec("DELETE FROM users WHERE user_id=$1", (user_id,))
+    invalidate_asset_ids_cache()
+    invalidate_alerts_cache()
+
+def invalidate_asset_ids_cache():
+    global asset_ids_cache_ts
+    asset_ids_cache_ts = 0.0
+
+def invalidate_alerts_cache():
+    global alert_rows_cache_dirty
+    alert_rows_cache_dirty = True
+
+async def get_unique_asset_ids() -> List[str]:
+    global asset_ids_cache, asset_ids_cache_ts
+    now = time.time()
+    if asset_ids_cache and (now - asset_ids_cache_ts) < ASSET_IDS_CACHE_TTL_SEC:
+        return list(asset_ids_cache)
+    rows = await db_fetchall("SELECT DISTINCT coingecko_id FROM assets")
+    asset_ids_cache = {
+        str(r["coingecko_id"])
+        for r in rows
+        if r.get("coingecko_id")
+    }
+    asset_ids_cache_ts = now
+    return list(asset_ids_cache)
 
 def reset_confirm_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1439,6 +1462,7 @@ async def add_asset_row(user_id: int, symbol: str, coingecko_id: str, name: str,
     if not row or "id" not in row:
         raise RuntimeError("add_asset_row: INSERT succeeded but no id returned")
 
+    invalidate_asset_ids_cache()
     await invalidate_summary_cache(user_id)
     return int(row["id"])
 
@@ -1450,10 +1474,13 @@ async def update_asset_row(user_id: int, asset_id: int,
         "WHERE user_id=$4 AND id=$5",
         (invested_usd, entry_price, qty_override, user_id, asset_id)
     )
+    invalidate_asset_ids_cache()
     await invalidate_summary_cache(user_id)
 
 async def delete_asset_row(user_id: int, asset_id: int):
     await db_exec("DELETE FROM assets WHERE user_id=$1 AND id=$2", (user_id, asset_id))
+    invalidate_asset_ids_cache()
+    invalidate_alerts_cache()
     await invalidate_summary_cache(user_id)
 
 async def replace_alerts(asset_id: int, alerts: List[Tuple[str, int, float]]):
@@ -1463,6 +1490,7 @@ async def replace_alerts(asset_id: int, alerts: List[Tuple[str, int, float]]):
             "INSERT INTO alerts(asset_id, type, pct, target_price) VALUES ($1, $2, $3, $4)",
             (asset_id, t, pct, target)
         )
+    invalidate_alerts_cache()
 
 async def list_alerts_for_asset(asset_id: int):
     return await db_fetchall("SELECT * FROM alerts WHERE asset_id=$1", (asset_id,))
@@ -1483,7 +1511,12 @@ async def recompute_alert_targets(asset_id: int, new_entry: float):
         await replace_alerts(asset_id, updated)
 
 async def pending_alerts_joined():
-    return await db_fetchall(
+    global alert_rows_cache, alert_rows_cache_ts, alert_rows_cache_dirty
+    now = time.time()
+    if not alert_rows_cache_dirty and (now - alert_rows_cache_ts) < ALERT_QUERY_CACHE_SEC:
+        return list(alert_rows_cache)
+
+    rows = await db_fetchall(
         """
         SELECT
           al.id AS alert_id,
@@ -1508,20 +1541,28 @@ async def pending_alerts_joined():
         """
     )
 
+    alert_rows_cache = rows
+    alert_rows_cache_ts = now
+    alert_rows_cache_dirty = False
+    return rows
+
 async def mark_alert_triggered(alert_id: int):
     await db_exec(
         "UPDATE alerts SET triggered=1, triggered_at=$1, rearm_ready=FALSE WHERE id=$2",
         (int(time.time()), alert_id)
     )
+    invalidate_alerts_cache()
 
 async def reset_alert_triggered(alert_id: int):
     await db_exec(
         "UPDATE alerts SET triggered=0, triggered_at=NULL, rearm_ready=FALSE WHERE id=$1",
         (alert_id,)
     )
+    invalidate_alerts_cache()
 
 async def set_alert_rearm_ready(alert_id: int, ready: bool):
     await db_exec("UPDATE alerts SET rearm_ready=$1 WHERE id=$2", (ready, alert_id))
+    invalidate_alerts_cache()
 
 # ---------------------------- calculations/formatting ----------------------------
 @dataclass
@@ -2861,8 +2902,7 @@ async def on_edit_quantity(m: Message, state: FSMContext):
 async def price_feed_loop():
     while True:
         try:
-            rows = await db_fetchall("SELECT DISTINCT coingecko_id FROM assets")
-            ids = [str(r["coingecko_id"]) for r in rows if r.get("coingecko_id")]
+            ids = await get_unique_asset_ids()
             if not ids:
                 await asyncio.sleep(PRICE_POLL_SECONDS)
                 continue
@@ -2918,10 +2958,12 @@ async def alerts_loop():
         try:
             rows = await pending_alerts_joined()
             if not rows:
+                await asyncio.sleep(ALERT_LOOP_INTERVAL_SEC)
                 continue
 
             ids = sorted({r["coingecko_id"] for r in rows if r.get("coingecko_id")})
             if not ids:
+                await asyncio.sleep(ALERT_LOOP_INTERVAL_SEC)
                 continue
 
             price_map, missing = await price_feed_get(ids, max_age=ALERT_PRICE_FRESH_SEC)
@@ -2961,6 +3003,7 @@ async def alerts_loop():
                     "alerts_loop: waiting for fresh prices %s",
                     ", ".join(sorted(missing_set))
                 )
+                await asyncio.sleep(ALERT_LOOP_INTERVAL_SEC)
                 continue
 
             for r in rows:
